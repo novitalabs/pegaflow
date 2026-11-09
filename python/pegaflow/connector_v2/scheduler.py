@@ -12,6 +12,12 @@ Lookup, per request, with ``local`` = vLLM's own hit:
    Blocks below the local hit are on the GPU already and count as present.
 3. ``semantics.resolve`` picks ``p``; only blocks past the local hit load.
 
+While the server fetches from SSD or peers a query answers Loading and vLLM
+asks again next step. As v1 keeps a probe per request, each namespace's
+answer is kept until the lookup ends, so a poll only re-asks what is still
+loading, under the same query id and keys. There is no wait budget: as in v1
+the request waits until the server answers.
+
 Loads are always asynchronous: a failed one is reported as a failed receive
 and vLLM recomputes the request (``kv_load_failure_policy=recompute``).
 
@@ -23,8 +29,7 @@ step that plans it until every worker reports that step saved
 from __future__ import annotations
 
 import logging
-import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Container, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -38,8 +43,6 @@ logger = logging.getLogger(__name__)
 class Policy:
     """Choices inside what semantics allows; can only narrow a hit."""
 
-    # How long a request may wait while the server fetches from SSD or peers.
-    loading_wait_ms: int = 1000
     # Resume points (largest first) whose window/checkpoint blocks are queried.
     probe_points: int = 2
 
@@ -80,13 +83,24 @@ class _Hit:
 
 
 @dataclass
+class _Ask:
+    """One namespace query of a lookup; ``hits`` is None while Loading."""
+
+    keys: list[bytes]
+    prefix: bool
+    hits: list[int] | None = None
+    lease: bytes | None = None
+
+
+@dataclass
 class _Req:
     request: Any
     # Per namespace index, the server's query id, kept for the request's life
     # as v1 keys prefetches by request id: SSD/RDMA fetches and the server's
     # failed-peer list follow the request across scheduler calls.
     query_ids: dict[int, str] = field(default_factory=dict)
-    loading_since: float | None = None
+    # Per namespace index, the answer of the lookup in progress.
+    asks: dict[int, _Ask] = field(default_factory=dict)
     hit: _Hit | None = None
     saved_upto: int | None = None
     junction: int = 0  # where the stored full-attention prefix ends
@@ -104,13 +118,11 @@ class Scheduler:
         rpc: Any,
         instance_id: str,
         policy: Policy | None = None,
-        clock: Callable[[], float] = time.monotonic,
     ):
         self._layout = layout
         self._rpc = rpc
         self._instance_id = instance_id
         self._policy = policy or Policy()
-        self._clock = clock
         self._reqs: dict[str, _Req] = {}
         self._plan = StepPlan()
         self._steps = 0
@@ -140,19 +152,15 @@ class Scheduler:
         try:
             hit = self._lookup(rec, local)
         except _Loading:
-            if rec.loading_since is None:
-                rec.loading_since = self._clock()
-            if (self._clock() - rec.loading_since) * 1000 < self._policy.loading_wait_ms:
-                return None, False
-            logger.info("[PegaKVConnectorV2] fetch wait expired req=%s", request.request_id)
-            self._count("wait_expired")
-            hit = None
+            return None, False
         except Exception:
             logger.warning(
                 "[PegaKVConnectorV2] lookup failed req=%s", request.request_id, exc_info=True
             )
             hit = None
-        rec.loading_since = None
+        # The lookup is over: release every answer the hit does not keep.
+        kept = set(hit.leases.values()) if hit is not None else set()
+        self._drop_asks(rec, kept)
         self._hint_junction(request, hit.p if hit is not None else local, rec.junction)
         if hit is None:
             return 0, False
@@ -163,19 +171,38 @@ class Scheduler:
     def _query(
         self, rec: _Req, i: int, keys: list[bytes], prefix: bool
     ) -> tuple[list[int], bytes | None]:
-        """Hit positions into ``keys`` and the lease; raises ``_Loading``."""
-        ns = self._layout.namespaces[i].namespace
-        query_id, ans = self._rpc.query_object(
-            self._instance_id, [(ns, k) for k in keys], prefix, rec.query_ids.get(i, "")
-        )
-        if query_id:
-            rec.query_ids[i] = query_id
-        if not hasattr(ans, "num_hit_blocks"):  # QueryLoading
-            raise _Loading
-        hits = list(ans.hit_positions) if not prefix else list(range(ans.num_hit_blocks))
-        if hits and not ans.lease:
-            raise RuntimeError(f"namespace {i}: {len(hits)} hits without a lease")
-        return hits, (ans.lease or None)
+        """Hit positions into ``keys`` and the lease; raises ``_Loading``.
+
+        A kept answer for the same keys is reused. A query still loading for
+        other keys is polled with its own keys first (the server answers
+        positions of the keys it was asked), then discarded, as v1 drops a
+        drifted probe.
+        """
+        ask = rec.asks.get(i)
+        if ask is not None and ask.hits is not None and (ask.keys, ask.prefix) != (keys, prefix):
+            self._release([ask.lease] if ask.lease else [])
+            ask = None
+        if ask is None:
+            ask = rec.asks[i] = _Ask(list(keys), prefix)
+        if ask.hits is None:
+            ns = self._layout.namespaces[i].namespace
+            query_id, ans = self._rpc.query_object(
+                self._instance_id,
+                [(ns, k) for k in ask.keys],
+                ask.prefix,
+                rec.query_ids.get(i, ""),
+            )
+            if query_id:
+                rec.query_ids[i] = query_id
+            if not hasattr(ans, "num_hit_blocks"):  # QueryLoading
+                raise _Loading
+            hits = list(ans.hit_positions) if not ask.prefix else list(range(ans.num_hit_blocks))
+            ask.hits, ask.lease = hits, (ans.lease or None)
+            if hits and not ask.lease:
+                raise RuntimeError(f"namespace {i}: {len(hits)} hits without a lease")
+        if (ask.keys, ask.prefix) != (keys, prefix):
+            return self._query(rec, i, keys, prefix)
+        return ask.hits, ask.lease
 
     def _lookup(self, rec: _Req, local: int) -> _Hit | None:
         request = rec.request
@@ -192,49 +219,43 @@ class Scheduler:
 
         leases: dict[int, bytes] = {}
         present: list[frozenset[int]] = [frozenset()] * len(nss)
-        try:
-            top = cap
-            for i, ns in enumerate(nss):
-                if ns.group.kind != sem.FULL:
-                    continue
-                start = local // ns.group.block_tokens
-                hits, lease = [], None
-                if start < len(keys[i]):
-                    hits, lease = self._query(rec, i, keys[i][start:], True)
+        top = cap
+        for i, ns in enumerate(nss):
+            if ns.group.kind != sem.FULL:
+                continue
+            start = local // ns.group.block_tokens
+            hits, lease = [], None
+            if start < len(keys[i]):
+                hits, lease = self._query(rec, i, keys[i][start:], True)
+            if lease:
+                leases[i] = lease
+            present[i] = frozenset(range(start + len(hits)))
+            top = min(top, (start + len(hits)) * ns.group.block_tokens)
+        if self._has_checkpoint:
+            rec.junction = top
+        points = [p for p in sem.candidates(groups, top, n_tokens) if p > local]
+        points = points[: max(self._policy.probe_points, 1)]
+        if not points:
+            return None
+        for i, ns in enumerate(nss):
+            g = ns.group
+            if g.kind == sem.FULL:
+                continue
+            on_gpu = frozenset(range(min(local // g.block_tokens, len(keys[i]))))
+            want = sorted({b for p in points for b in sem.needed(g, p)} - on_gpu)
+            want = [b for b in want if b < len(keys[i])]
+            found: set[int] = set()
+            if want:
+                hits, lease = self._query(rec, i, [keys[i][b] for b in want], False)
                 if lease:
                     leases[i] = lease
-                present[i] = frozenset(range(start + len(hits)))
-                top = min(top, (start + len(hits)) * ns.group.block_tokens)
-            if self._has_checkpoint:
-                rec.junction = top
-            points = [p for p in sem.candidates(groups, top, n_tokens) if p > local]
-            points = points[: max(self._policy.probe_points, 1)]
-            if not points:
-                self._release(leases.values())
-                return None
-            for i, ns in enumerate(nss):
-                g = ns.group
-                if g.kind == sem.FULL:
-                    continue
-                on_gpu = frozenset(range(min(local // g.block_tokens, len(keys[i]))))
-                want = sorted({b for p in points for b in sem.needed(g, p)} - on_gpu)
-                want = [b for b in want if b < len(keys[i])]
-                found: set[int] = set()
-                if want:
-                    hits, lease = self._query(rec, i, [keys[i][b] for b in want], False)
-                    if lease:
-                        leases[i] = lease
-                    found = {want[h] for h in hits}
-                present[i] = on_gpu | found
-        except BaseException:
-            self._release(leases.values())
-            raise
+                found = {want[h] for h in hits}
+            present[i] = on_gpu | found
 
         p = sem.resolve(groups, present, n_tokens)
         p = max(0, min(int(self._policy.accept(p)), p))
         hit = _Hit(p, local, present, keys, leases, n_tokens)
         if p <= local or p % layout.step or not self._wanted(hit, p):
-            self._release(leases.values())
             return None
         return hit
 
@@ -403,12 +424,14 @@ class Scheduler:
         rec = self._reqs.pop(req_id, None)
         if rec is not None:
             self._drop_hit(rec)
+            self._drop_asks(rec)
         if not self._reqs and self.stats:
             logger.info("[PegaKVConnectorV2] stats %s", dict(sorted(self.stats.items())))
 
     def shutdown(self) -> None:
         for rec in self._reqs.values():
             self._drop_hit(rec)
+            self._drop_asks(rec)
         self._release(lease for lp in self._plan.loads for lease in lp.leases)
         self._plan.loads.clear()
 
@@ -419,6 +442,10 @@ class Scheduler:
         if rec.hit is not None:
             hit, rec.hit = rec.hit, None
             self._release(hit.leases.values())
+
+    def _drop_asks(self, rec: _Req, kept: Container[bytes] = ()) -> None:
+        asks, rec.asks = rec.asks, {}
+        self._release(a.lease for a in asks.values() if a.lease and a.lease not in kept)
 
     def _release(self, leases: Iterable[bytes]) -> None:
         for lease in leases:

@@ -116,6 +116,7 @@ class FakeRpc:
     def __init__(self, stored: set[tuple[bytes, bytes]]):
         self.stored = stored
         self.loading = 0  # answer Loading this many times first
+        self.members_loading = 0  # same, for membership queries only
         self.leases: set[bytes] = set()
         self.queries: list[tuple[bool, int]] = []
         self.query_ids: list[str] = []
@@ -126,6 +127,9 @@ class FakeRpc:
         query_id = query_id or f"q{len(self.query_ids)}"
         if self.loading:
             self.loading -= 1
+            return query_id, Loading()
+        if not prefix and self.members_loading:
+            self.members_loading -= 1
             return query_id, Loading()
         hits = [i for i, k in enumerate(keys) if k in self.stored]
         if prefix:
@@ -200,20 +204,35 @@ def test_hybrid_hit_asks_vllm_to_checkpoint_where_the_full_prefix_ends():
     assert req.shared_prefix_boundary == 20
 
 
-def test_loading_waits_then_gives_up():
+def test_loading_polls_only_what_is_still_loading():
+    layout = _layout(FULL4, CKPT4)
+    full, ckpt = layout.namespaces
+    hashes = _hashes(6)
+    stored = {(full.namespace, h) for h in hashes[:5]} | {(ckpt.namespace, hashes[3])}
+    rpc = FakeRpc(stored)
+    rpc.loading, rpc.members_loading = 1, 2
+    s = Scheduler(layout, rpc, "inst")
+    req = Req("r", 25, hashes)
+    for _ in range(3):
+        assert s.get_num_new_matched_tokens(req, 0) == (None, False)
+    assert s.get_num_new_matched_tokens(req, 0) == (16, True)
+    # The prefix answer is kept while the checkpoint query loads, and each
+    # namespace polls under one query id, so the server's fetch can finish.
+    assert [prefix for prefix, _ in rpc.queries] == [True, True, False, False, False]
+    assert rpc.query_ids == ["", "q1", "", "q3", "q3"] and len(rpc.leases) == 2
+
+
+def test_drifted_loading_query_is_answered_then_dropped():
     layout = _layout(FULL4)
     rpc = FakeRpc({(layout.namespaces[0].namespace, h) for h in _hashes(4)})
-    rpc.loading = 10
-    now = [0.0]
-    s = Scheduler(layout, rpc, "inst", clock=lambda: now[0])
+    rpc.loading = 1
+    s = Scheduler(layout, rpc, "inst")
     req = Req("r", 17, _hashes(4))
     assert s.get_num_new_matched_tokens(req, 0) == (None, False)
-    now[0] = 2.0
-    assert s.get_num_new_matched_tokens(req, 0) == (0, False)
-    assert not rpc.leases
-    # One query id for the request's life, so the server's fetch and its
-    # failed-peer list follow the request.
-    assert rpc.query_ids[0] == "" and set(rpc.query_ids[1:]) == {"q1"}
+    # vLLM's own hit grew meanwhile: the old query is polled with its keys,
+    # its lease released, and the new keys asked.
+    assert s.get_num_new_matched_tokens(req, 4) == (12, True)
+    assert rpc.queries == [(True, 4), (True, 4), (True, 3)] and len(rpc.leases) == 1
 
 
 def test_failed_load_recomputes_and_never_loads_again():
