@@ -808,13 +808,14 @@ impl PegaEngine {
         keys: &[BlockKey],
         consumers: usize,
     ) -> ObjectQueryStatus {
-        let fetched: HashMap<BlockKey, Arc<SealedBlock>> =
+        // A finished fetch answers the query even when it found nothing:
+        // starting another one for the same keys would loop forever.
+        let (polled, fetched): (bool, HashMap<BlockKey, Arc<SealedBlock>>) =
             match self.storage.poll_members(tag).await {
                 MembersPoll::Loading => return ObjectQueryStatus::Loading,
-                MembersPoll::Done(fetched) => fetched.into_iter().collect(),
-                MembersPoll::Idle => HashMap::new(),
+                MembersPoll::Done(fetched) => (true, fetched.into_iter().collect()),
+                MembersPoll::Idle => (false, HashMap::new()),
             };
-        let polled = !fetched.is_empty();
         // Touch what is resident; fetched blocks evicted since are still held here.
         let found: Vec<Option<Arc<SealedBlock>>> = self
             .storage
