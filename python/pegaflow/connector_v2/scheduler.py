@@ -82,6 +82,9 @@ class _Hit:
 @dataclass
 class _Req:
     request: Any
+    # Per namespace index, the server's query id, kept for the request's life
+    # as v1 keys prefetches by request id: SSD/RDMA fetches and the server's
+    # failed-peer list follow the request across scheduler calls.
     query_ids: dict[int, str] = field(default_factory=dict)
     loading_since: float | None = None
     hit: _Hit | None = None
@@ -150,7 +153,6 @@ class Scheduler:
             )
             hit = None
         rec.loading_since = None
-        rec.query_ids.clear()
         self._hint_junction(request, hit.p if hit is not None else local, rec.junction)
         if hit is None:
             return 0, False
@@ -166,10 +168,10 @@ class Scheduler:
         query_id, ans = self._rpc.query_object(
             self._instance_id, [(ns, k) for k in keys], prefix, rec.query_ids.get(i, "")
         )
-        if not hasattr(ans, "num_hit_blocks"):  # QueryLoading
+        if query_id:
             rec.query_ids[i] = query_id
+        if not hasattr(ans, "num_hit_blocks"):  # QueryLoading
             raise _Loading
-        rec.query_ids.pop(i, None)
         hits = list(ans.hit_positions) if not prefix else list(range(ans.num_hit_blocks))
         if hits and not ans.lease:
             raise RuntimeError(f"namespace {i}: {len(hits)} hits without a lease")

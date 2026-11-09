@@ -118,12 +118,15 @@ class FakeRpc:
         self.loading = 0  # answer Loading this many times first
         self.leases: set[bytes] = set()
         self.queries: list[tuple[bool, int]] = []
+        self.query_ids: list[str] = []
 
     def query_object(self, instance_id, keys, prefix, query_id):
         self.queries.append((prefix, len(keys)))
+        self.query_ids.append(query_id)
+        query_id = query_id or f"q{len(self.query_ids)}"
         if self.loading:
             self.loading -= 1
-            return "q1", Loading()
+            return query_id, Loading()
         hits = [i for i, k in enumerate(keys) if k in self.stored]
         if prefix:
             n = 0
@@ -133,7 +136,7 @@ class FakeRpc:
         lease = f"lease{len(self.leases)}".encode() if hits else b""
         if lease:
             self.leases.add(lease)
-        return "", Ready(len(hits), lease, [] if prefix else hits)
+        return query_id, Ready(len(hits), lease, [] if prefix else hits)
 
     def release(self, lease):
         self.leases.discard(lease)
@@ -208,6 +211,9 @@ def test_loading_waits_then_gives_up():
     now[0] = 2.0
     assert s.get_num_new_matched_tokens(req, 0) == (0, False)
     assert not rpc.leases
+    # One query id for the request's life, so the server's fetch and its
+    # failed-peer list follow the request.
+    assert rpc.query_ids[0] == "" and set(rpc.query_ids[1:]) == {"q1"}
 
 
 def test_failed_load_recomputes_and_never_loads_again():

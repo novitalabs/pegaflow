@@ -69,18 +69,20 @@ impl RdmaFetch {
     }
 
     /// What peers serve of `hashes`, each on its own: one MetaServer
-    /// membership query and one fetch per holder for all of them.
+    /// membership query and one fetch per holder for all of them. Also
+    /// returns how many the MetaServer said peers hold.
     async fn fetch_members(
         &self,
         req_id: &str,
         namespace: &str,
         hashes: &[Vec<u8>],
-    ) -> PrefetchResult {
+    ) -> (usize, PrefetchResult) {
         let Some((found, plan)) = self.0.query_members(namespace, hashes).await else {
-            return Vec::new();
+            return (0, Vec::new());
         };
         let held: Vec<Vec<u8>> = found.iter().map(|&i| hashes[i].clone()).collect();
-        self.0.fetch_plan(&plan, req_id, namespace, &held).await
+        let blocks = self.0.fetch_plan(&plan, req_id, namespace, &held).await;
+        (held.len(), blocks)
     }
 }
 
@@ -91,8 +93,8 @@ impl RdmaFetch {
         _req_id: &str,
         _namespace: &str,
         _hashes: &[Vec<u8>],
-    ) -> PrefetchResult {
-        Vec::new()
+    ) -> (usize, PrefetchResult) {
+        (0, Vec::new())
     }
 
     async fn try_fetch_prefix(
@@ -181,6 +183,8 @@ struct MembersEntry {
 #[derive(Default)]
 struct MembersResult {
     rdma: PrefetchResult,
+    /// Blocks the MetaServer said peers hold; `rdma` may come back shorter.
+    rdma_planned: usize,
     ssd: PrefetchResult,
 }
 
@@ -264,8 +268,18 @@ impl PrefetchScheduler {
         if state.members.contains_key(id) {
             return true;
         }
+        // As `start_prefetch_task`: a peer that served less than promised
+        // for this id is not asked again.
+        let rdma_fetch = self
+            .rdma_fetch
+            .as_ref()
+            .filter(|_| !state.failed_remote.contains_key(id))
+            .cloned();
+        if rdma_fetch.is_none() && self.ssd_store.is_none() {
+            return false;
+        }
         let deps = PrefetchTaskDeps {
-            rdma_fetch: self.rdma_fetch.clone(),
+            rdma_fetch,
             ssd_store: self.ssd_store.clone(),
             prefetch_state: Arc::clone(&self.state),
             max_prefetch_blocks: self.max_prefetch_blocks,
@@ -297,6 +311,18 @@ impl PrefetchScheduler {
             warn!("Membership prefetch task failed for id={id}: {e}");
             MembersResult::default()
         });
+        // As in `poll_existing`: don't ask the peers again for this id.
+        if result.rdma.len() < result.rdma_planned {
+            self.state
+                .lock()
+                .failed_remote
+                .insert(id.to_string(), Instant::now());
+            info!(
+                "RDMA membership fetch returned fewer blocks than expected: id={id} returned={} expected={}",
+                result.rdma.len(),
+                result.rdma_planned
+            );
+        }
         // As in `poll_existing`: SSD-served blocks were registered when saved here.
         let resident = read_cache.batch_insert_refs(&result.rdma);
         if let Some(client) = &self.metaserver_client
@@ -779,7 +805,7 @@ async fn run_members_task(
     let mut out = MembersResult::default();
     if let Some(rdma) = &deps.rdma_fetch {
         let hashes: Vec<Vec<u8>> = keys.iter().map(|k| k.hash.clone()).collect();
-        out.rdma = rdma.fetch_members(&id, &keys[0].namespace, &hashes).await;
+        (out.rdma_planned, out.rdma) = rdma.fetch_members(&id, &keys[0].namespace, &hashes).await;
     }
     let Some(ssd) = &deps.ssd_store else {
         return out;
@@ -946,6 +972,43 @@ mod tests {
         assert!(!poll_outcome_blacklists_req(Some(PrefetchSource::Rdma), 3, 3).await);
         assert!(!poll_outcome_blacklists_req(Some(PrefetchSource::Ssd), 3, 2).await);
         assert!(!poll_outcome_blacklists_req(None, 0, 0).await);
+    }
+
+    async fn members_outcome_blacklists_id(planned: usize, returned: usize) -> bool {
+        let scheduler = PrefetchScheduler::new(None, None, None, 16);
+        let read_cache = ReadCache::new(1 << 20, false, None);
+        let result = MembersResult {
+            rdma: (0..returned).map(|i| (key(i as u8), block())).collect(),
+            rdma_planned: planned,
+            ssd: Vec::new(),
+        };
+        let handle = tokio::spawn(async move { result });
+        while !handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        scheduler.state.lock().members.insert(
+            "q".to_string(),
+            MembersEntry {
+                handle,
+                started_at: Instant::now(),
+            },
+        );
+
+        assert!(matches!(
+            scheduler.poll_members(&read_cache, "q").await,
+            MembersPoll::Done(_)
+        ));
+        scheduler.state.lock().failed_remote.contains_key("q")
+    }
+
+    #[tokio::test]
+    async fn short_rdma_membership_fetch_blacklists_its_id() {
+        // Same rule as the prefix path: fewer blocks than the MetaServer
+        // promised, including none, keeps peers out of later fetches.
+        assert!(members_outcome_blacklists_id(3, 2).await);
+        assert!(members_outcome_blacklists_id(3, 0).await);
+        assert!(!members_outcome_blacklists_id(3, 3).await);
+        assert!(!members_outcome_blacklists_id(0, 0).await);
     }
 
     #[test]
