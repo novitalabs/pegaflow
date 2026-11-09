@@ -8,8 +8,11 @@ Lookup, per request, with ``local`` = vLLM's own hit:
 1. Every full namespace gets a prefix query from block ``local / bt``. The
    shortest answer bounds every hit (``top``).
 2. Window and checkpoint namespaces get one membership query over the blocks
-   the few largest resume points ``<= top`` need (``Policy.probe_points``).
-   Blocks below the local hit are on the GPU already and count as present.
+   the resume points ``<= top`` need: every point for checkpoints, one block
+   each, as v1 asks membership over the whole prefix (checkpoints sit where
+   past prefill chunks happened to end); the few largest for windows
+   (``Policy.probe_points``). Blocks below the local hit are on the GPU
+   already and count as present.
 3. ``semantics.resolve`` picks ``p``; only blocks past the local hit load.
 
 While the server fetches from SSD or peers a query answers Loading and vLLM
@@ -43,7 +46,7 @@ logger = logging.getLogger(__name__)
 class Policy:
     """Choices inside what semantics allows; can only narrow a hit."""
 
-    # Resume points (largest first) whose window/checkpoint blocks are queried.
+    # Resume points (largest first) whose window blocks are queried.
     probe_points: int = 2
 
     def accept(self, p: int) -> int:
@@ -234,7 +237,6 @@ class Scheduler:
         if self._has_checkpoint:
             rec.junction = top
         points = [p for p in sem.candidates(groups, top, n_tokens) if p > local]
-        points = points[: max(self._policy.probe_points, 1)]
         if not points:
             return None
         for i, ns in enumerate(nss):
@@ -242,7 +244,10 @@ class Scheduler:
             if g.kind == sem.FULL:
                 continue
             on_gpu = frozenset(range(min(local // g.block_tokens, len(keys[i]))))
-            want = sorted({b for p in points for b in sem.needed(g, p)} - on_gpu)
+            probe = (
+                points if g.kind == sem.CHECKPOINT else points[: max(self._policy.probe_points, 1)]
+            )
+            want = sorted({b for p in probe for b in sem.needed(g, p)} - on_gpu)
             want = [b for b in want if b < len(keys[i])]
             found: set[int] = set()
             if want:

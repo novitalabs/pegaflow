@@ -191,16 +191,17 @@ def test_hit_loads_only_past_local_and_releases_unused_leases():
     assert loaded == [(0, 12), (0, 13), (0, 14), (1, 23), (1, 24)]
 
 
-def test_hybrid_hit_asks_vllm_to_checkpoint_where_the_full_prefix_ends():
+@pytest.mark.parametrize("ckpt_block,expected", [(3, 16), (0, 4)], ids=["near-top", "deep"])
+def test_hybrid_hit_asks_vllm_to_checkpoint_where_the_full_prefix_ends(ckpt_block, expected):
     layout = _layout(FULL4, CKPT4)
     full, ckpt = layout.namespaces
     hashes = _hashes(6)
-    stored = {(full.namespace, h) for h in hashes[:5]} | {(ckpt.namespace, hashes[3])}
+    stored = {(full.namespace, h) for h in hashes[:5]} | {(ckpt.namespace, hashes[ckpt_block])}
     s = Scheduler(layout, FakeRpc(stored), "inst")
     req = Req("r", 25, hashes)
-    # Full blocks back 20 tokens, the only checkpoint is at 16: resume at 16,
-    # and have vLLM commit a checkpoint at 20 for the next request.
-    assert s.get_num_new_matched_tokens(req, 0) == (16, True)
+    # Full blocks back 20 tokens; resume at the only checkpoint, however far
+    # below, and have vLLM commit a checkpoint at 20 for the next request.
+    assert s.get_num_new_matched_tokens(req, 0) == (expected, True)
     assert req.shared_prefix_boundary == 20
 
 
