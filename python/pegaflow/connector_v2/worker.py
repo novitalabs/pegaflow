@@ -312,6 +312,8 @@ class Worker:
             try:
                 for j in batch:
                     j.ready.synchronize()
+                # As v1: time the RPC, not the wait for the forward pass.
+                start = time.perf_counter()
                 self._rpc.save_objects(self._instance_id, self._rank, writes)
                 ok = True
             except ValueError as e:

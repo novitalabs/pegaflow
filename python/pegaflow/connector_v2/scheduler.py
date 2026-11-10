@@ -17,7 +17,8 @@ Lookup, per request, with ``local`` = vLLM's own hit:
 3. ``semantics.resolve`` picks ``p``; only blocks past the local hit load.
 
 While the server fetches from SSD or peers a query answers Loading and vLLM
-asks again next step. As v1 keeps a probe per request, each namespace's
+asks again next step. Every namespace of a pass is asked before the lookup
+waits, so their fetches overlap: one wait per pass, not one per namespace. As v1 keeps a probe per request, each namespace's
 answer is kept until the lookup ends, so a poll only re-asks what is still
 loading, under the same query id and keys. There is no wait budget: as in v1
 the request waits until the server answers.
@@ -118,6 +119,26 @@ class _Req:
 
 class _Loading(Exception):
     """A namespace query is still fetching from SSD or peers."""
+
+
+class _Pass:
+    """Asks every namespace of a lookup pass: ``with`` swallows ``_Loading``,
+    ``wait`` raises it once the whole pass was asked."""
+
+    loading = False
+
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, kind: Any, exc: Any, tb: Any) -> bool:
+        if kind is _Loading:
+            self.loading = True
+            return True
+        return False
+
+    def wait(self) -> None:
+        if self.loading:
+            raise _Loading
 
 
 class Scheduler:
@@ -266,17 +287,20 @@ class Scheduler:
         leases: dict[int, bytes] = {}
         present: list[frozenset[int]] = [frozenset()] * len(nss)
         top = cap
+        pending = _Pass()
         for i, ns in enumerate(nss):
             if ns.group.kind != sem.FULL:
                 continue
             start = local // ns.group.block_tokens
             hits, lease = [], None
             if start < len(keys[i]):
-                hits, lease = self._query(rec, i, keys[i][start:], True)
+                with pending:
+                    hits, lease = self._query(rec, i, keys[i][start:], True)
             if lease:
                 leases[i] = lease
             present[i] = frozenset(range(start + len(hits)))
             top = min(top, (start + len(hits)) * ns.group.block_tokens)
+        pending.wait()
         if self._has_checkpoint:
             rec.junction = top
         points = [p for p in sem.candidates(groups, top, n_tokens) if p > local]
@@ -287,14 +311,18 @@ class Scheduler:
             if ns.group.kind == sem.FULL:
                 continue
             probe = points if ns.group.kind == sem.CHECKPOINT else points[:1]
-            present[i] = self._members(rec, i, keys[i], local, probe, leases, 0)
+            with pending:
+                present[i] = self._members(rec, i, keys[i], local, probe, leases, 0)
+        pending.wait()
         if windows and sem.resolve(groups, present, n_tokens) < points[0]:
             # As v1: an earlier point needs another window, so ask every
             # point back to the local hit. This answer replaces the first,
             # whose lease the lookup's end releases.
             for i in windows:
                 leases.pop(i, None)
-                present[i] = self._members(rec, i, keys[i], local, points, leases, 1)
+                with pending:
+                    present[i] = self._members(rec, i, keys[i], local, points, leases, 1)
+            pending.wait()
 
         p = sem.resolve(groups, present, n_tokens)
         p = max(0, min(int(self._policy.accept(p)), p))

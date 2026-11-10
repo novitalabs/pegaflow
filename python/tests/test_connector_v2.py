@@ -257,6 +257,21 @@ def test_loading_polls_only_what_is_still_loading():
     assert stats["prefetch_blocks"] == [5] and "pending_prefetches" not in stats
 
 
+def test_loading_namespaces_of_a_pass_wait_together():
+    layout = _layout(FULL4, CKPT4, CKPT4, CKPT4)
+    hashes = _hashes(6)
+    full = layout.namespaces[0]
+    stored = {(full.namespace, h) for h in hashes[:5]}
+    stored |= {(ns.namespace, hashes[3]) for ns in layout.namespaces[1:]}
+    rpc = FakeRpc(stored)
+    rpc.members_loading = 3  # each checkpoint namespace starts a fetch
+    s = Scheduler(layout, rpc, "inst")
+    req = Req("r", 25, hashes)
+    # All three fetches start in one step, so the hit comes one step later.
+    assert s.get_num_new_matched_tokens(req, 0) == (None, False)
+    assert s.get_num_new_matched_tokens(req, 0) == (16, True)
+
+
 def test_drifted_loading_query_is_answered_then_dropped():
     layout = _layout(FULL4)
     rpc = FakeRpc({(layout.namespaces[0].namespace, h) for h in _hashes(4)})
