@@ -4,18 +4,15 @@ vLLM-free: the connector passes plain values in and the server client is
 duck-typed (``query_object`` / ``release``), so unit tests drive it with fakes.
 
 Lookup, per request, with ``local`` = vLLM's own hit. A query is a prefix
-query (the leading keys held) or, for a checkpoint, a latest query (only the
-last key held, in memory, on SSD or at a peer; the server fetches only that
-one).
+query (the leading keys held) or, for a checkpoint, a membership query (every
+key held in memory, on SSD or at a peer; the server fetches those first).
 
 1. Every full namespace gets a prefix query from block ``local / bt``; the
    shortest answer bounds every hit (``top``).
-2. Then every checkpoint namespace asks for its latest state at the resume
-   points up to ``top`` only, in the same step when the prefix answers at
-   once. A state above ``top`` could not be used, and asking past what the
-   server holds makes it look on SSD and at peers (Loading). A checkpoint
-   above the lowest of the others asks again below it, until they meet.
-   A window namespace asks for the blocks
+2. Then every checkpoint namespace asks a membership query over its states
+   at the resume points up to ``top`` only, in the same step when the prefix
+   answers at once; a state above ``top`` could not be used. Only the points
+   every checkpoint holds stay. A window namespace asks for the blocks
    the top point needs as a prefix query; one with a hole asks again at the
    highest lower point whose window ends below the hole, as v1 falls back
    when window hits are not monotone. Blocks below the local hit are on the
@@ -247,7 +244,7 @@ class Scheduler:
         bt = self._layout.namespaces[i].group.block_tokens
         return frozenset(range(min(local // bt, len(keys))))
 
-    def _latest(
+    def _members(
         self,
         rec: _Req,
         i: int,
@@ -257,8 +254,8 @@ class Scheduler:
         leases: dict[int, bytes],
         phase: int,
     ) -> frozenset[int]:
-        """Checkpoint namespace ``i``: the latest state held at ``points``,
-        GPU blocks included."""
+        """Checkpoint namespace ``i``: the states held at ``points``, GPU
+        blocks included."""
         g = self._layout.namespaces[i].group
         on_gpu = self._on_gpu(i, keys, local)
         want = sorted({b for p in points for b in sem.needed(g, p)} - on_gpu)
@@ -338,30 +335,18 @@ class Scheduler:
             return None
         for i in ckpts:
             with pending:
-                present[i] = self._latest(rec, i, keys[i], local, points, leases, 0)
+                present[i] = self._members(rec, i, keys[i], local, points, leases, 0)
         pending.wait()
-
-        phase = 1
-        while True:
-            # Each checkpoint answer is one state; the ones above the lowest
-            # of the others ask again below it. The bound only falls, so this
-            # ends.
-            at = {i: self._ckpt_point(i, present[i], local) for i in ckpts}
-            bound = min([top, *at.values()])
-            above = [i for i in ckpts if at[i] > bound]
-            if not above:
-                break
-            below = [p for p in points if p <= bound]
-            for i in above:
-                leases.pop(i, None)
-                with pending:
-                    present[i] = self._latest(rec, i, keys[i], local, below, leases, phase)
-            pending.wait()
-            phase += 1
+        # Only the points every checkpoint holds; the load takes that one
+        # state of each, the rest of the lease is released unloaded.
+        points = [
+            q
+            for q in points
+            if all(present[i].issuperset(sem.needed(nss[i].group, q)) for i in ckpts)
+        ]
         # Windows ask the blocks of the highest point left. As v1 falls back
         # when window hits are not monotone, a window with a hole asks again
         # at the highest lower point whose window ends below the hole.
-        points = [q for q in points if q <= bound]
         at_p = points[0] if windows and points else 0
         phase = 0
         while at_p:
@@ -399,13 +384,6 @@ class Scheduler:
         if p <= local or not sem.resumable_at(groups, p) or not self._wanted(hit, p):
             return None
         return hit
-
-    def _ckpt_point(self, i: int, present: frozenset[int], local: int) -> int:
-        """Resume point the latest stored state of checkpoint namespace ``i``
-        backs (0 if none past the local hit)."""
-        bt = self._layout.namespaces[i].group.block_tokens
-        ends = [(b + 1) * bt for b in present if (b + 1) * bt > local]
-        return max(ends, default=0)
 
     def _hint_junction(self, request: Any, resumable: int, junction: int) -> None:
         """As v1: when the stored full-attention prefix runs past the resume

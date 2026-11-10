@@ -68,13 +68,6 @@ impl RdmaFetch {
         Some((found, blocks))
     }
 
-    /// Index of the last of `hashes` a peer holds, from one MetaServer
-    /// membership query; no fetch.
-    async fn last_member(&self, namespace: &str, hashes: &[Vec<u8>]) -> Option<usize> {
-        let (found, _plan) = self.0.query_members(namespace, hashes).await?;
-        found.last().copied()
-    }
-
     /// What peers serve of `hashes`, each on its own: one MetaServer
     /// membership query and one fetch per holder for all of them. Also
     /// returns how many the MetaServer said peers hold.
@@ -95,10 +88,6 @@ impl RdmaFetch {
 
 #[cfg(not(feature = "rdma"))]
 impl RdmaFetch {
-    async fn last_member(&self, _namespace: &str, _hashes: &[Vec<u8>]) -> Option<usize> {
-        None
-    }
-
     async fn fetch_members(
         &self,
         _req_id: &str,
@@ -268,12 +257,11 @@ impl PrefetchScheduler {
         }
     }
 
-    /// Start fetching, for `id`, the last of `keys` (one namespace, ascending)
-    /// that a peer or SSD holds: one MetaServer membership query, then a
-    /// fetch of that key alone. False when nothing can serve them (without a
-    /// peer to ask, SSD is checked here); true as well when a fetch of `id`
-    /// already runs.
-    pub(super) fn start_latest(&self, id: &str, keys: Vec<BlockKey>) -> bool {
+    /// Start fetching the `keys` of one namespace for `id`, peers first and
+    /// then SSD, each key on its own. False when nothing can serve them
+    /// (without a peer to ask, SSD is checked here); true as well when a
+    /// fetch of `id` already runs.
+    pub(super) fn start_members(&self, id: &str, keys: Vec<BlockKey>) -> bool {
         if keys.is_empty() {
             return false;
         }
@@ -310,7 +298,7 @@ impl PrefetchScheduler {
             return true;
         }
         let task_id = id.to_string();
-        let handle = tokio::spawn(async move { run_latest_task(deps, task_id, keys).await });
+        let handle = tokio::spawn(async move { run_members_task(deps, task_id, keys).await });
         state.members.insert(
             id.to_string(),
             MembersEntry {
@@ -820,31 +808,6 @@ async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> 
 
     record_tier_attribution(total, hit, 0, None, emit_tier_metrics);
     build_ready_result(prefix_blocks, total, None, 0, &[], Vec::new())
-}
-
-/// The last of `keys` a peer or SSD holds, fetched alone.
-async fn run_latest_task(deps: PrefetchTaskDeps, id: String, keys: Vec<BlockKey>) -> MembersResult {
-    let on_ssd = deps.ssd_store.as_ref().and_then(|ssd| {
-        ssd.contains_keys(keys.iter())
-            .iter()
-            .rposition(|&held| held)
-    });
-    let remote = match &deps.rdma_fetch {
-        Some(rdma) => {
-            let hashes: Vec<Vec<u8>> = keys.iter().map(|k| k.hash.clone()).collect();
-            rdma.last_member(&keys[0].namespace, &hashes).await
-        }
-        None => None,
-    };
-    let Some(last) = on_ssd.max(remote) else {
-        return MembersResult::default();
-    };
-    let deps = PrefetchTaskDeps {
-        // Only a peer holding the last key is worth asking for it.
-        rdma_fetch: deps.rdma_fetch.filter(|_| remote == Some(last)),
-        ..deps
-    };
-    run_members_task(deps, id, vec![keys[last].clone()]).await
 }
 
 async fn run_members_task(

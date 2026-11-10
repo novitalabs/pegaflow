@@ -343,11 +343,11 @@ message SaveObjectsResponse {
 
 message QueryObjectRequest {
   string instance_id = 1;
-  // One namespace, in order: prefix queries count from keys[0], latest
-  // queries (keys ascending) answer an index into this list.
+  // One namespace, in order: prefix queries count from keys[0], membership
+  // queries answer indexes into this list.
   repeated ObjectKey keys = 2;
-  // True: the leading keys held. False: only the last key held in memory,
-  // on SSD or at a peer; only that one is fetched.
+  // True: the leading keys held. False: every key held in memory, on SSD or
+  // at a peer; the misses found elsewhere are fetched first.
   bool prefix_search = 3;
   // Optional; the server generates one when empty. Poll a Loading answer
   // with the same query_id and keys.

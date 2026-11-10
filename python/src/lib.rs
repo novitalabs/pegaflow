@@ -694,8 +694,8 @@ impl EngineRpcClient {
     /// Args:
     ///     instance_id: Model instance ID
     ///     keys: `(namespace, prefix)` pairs, all of one namespace
-    ///     prefix_search: Leading hits (True) or only the last key held
-    ///         anywhere, fetching only that one (False)
+    ///     prefix_search: Leading hits (True) or every key held anywhere,
+    ///         fetching the misses first (False)
     ///     query_id: Id of the query being polled; empty for a new one
     ///
     /// Returns:

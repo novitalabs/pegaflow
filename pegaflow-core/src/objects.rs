@@ -738,11 +738,10 @@ impl PegaEngine {
     ///
     /// With `prefix_search` it is v1 `QueryPrefetch` without
     /// `wait_for_full_prefix`: the leading keys in memory, or `Loading` while
-    /// SSD and peers bring more in. Otherwise (keys ascending) only the last
-    /// key held in memory, on SSD or at a peer: `Loading` while one past the
-    /// last in memory may be elsewhere, and only that one is fetched. Poll
-    /// with the same `query_id` and keys; a `None` id gets a fresh one.
-    /// Returns the id and the answer.
+    /// SSD and peers bring more in. Otherwise every key stands on its own:
+    /// keys not in memory are fetched from peers and SSD, and the answer is
+    /// `Loading` until that ends. Poll with the same `query_id` and keys; a
+    /// `None` id gets a fresh one. Returns the id and the answer.
     pub async fn query_object(
         &self,
         instance_id: &str,
@@ -775,7 +774,7 @@ impl PegaEngine {
             self.query_object_prefix(instance_id, &tag, &block_keys, consumers)
                 .await
         } else {
-            self.query_object_latest(instance_id, &tag, &block_keys, consumers)
+            self.query_object_members(instance_id, &tag, &block_keys, consumers)
                 .await
         };
         Ok((query_id, status))
@@ -811,65 +810,63 @@ impl PegaEngine {
         }
     }
 
-    /// Only the last of `keys` held in memory, on SSD or at a peer. A first
-    /// ask with keys past the last in memory starts a fetch of the last one
-    /// held elsewhere and answers `Loading`; the MetaServer is asked off the
-    /// RPC.
-    async fn query_object_latest(
+    async fn query_object_members(
         &self,
         instance_id: &str,
         tag: &str,
         keys: &[BlockKey],
         consumers: usize,
     ) -> ObjectQueryStatus {
+        // A finished fetch answers the query even when it found nothing:
+        // starting another one for the same keys would loop forever.
         let (polled, fetched): (bool, HashMap<BlockKey, Arc<SealedBlock>>) =
             match self.storage.poll_members(tag).await {
                 MembersPoll::Loading => return ObjectQueryStatus::Loading,
                 MembersPoll::Done(fetched) => (true, fetched.into_iter().collect()),
                 MembersPoll::Idle => (false, HashMap::new()),
             };
-        let here = self
+        // Touch what is resident; fetched blocks evicted since are still held here.
+        let found: Vec<Option<Arc<SealedBlock>>> = self
             .storage
-            .peek_blocks(keys)
+            .get_blocks_aligned(keys)
             .into_iter()
             .zip(keys)
-            .rposition(|(b, k)| b.is_some() || fetched.contains_key(k));
-        let after = here.map_or(0, |i| i + 1);
-        if !polled && self.storage.start_latest(tag, keys[after..].to_vec()) {
-            return ObjectQueryStatus::Loading;
+            .map(|(b, k)| b.or_else(|| fetched.get(k).cloned()))
+            .collect();
+        if !polled {
+            let mut seen = HashSet::new();
+            let missing: Vec<BlockKey> = keys
+                .iter()
+                .zip(&found)
+                .filter(|(k, b)| b.is_none() && seen.insert(*k))
+                .map(|(k, _)| k.clone())
+                .collect();
+            if self.storage.start_members(tag, missing) {
+                return ObjectQueryStatus::Loading;
+            }
+        }
+        let mut held = HashMap::new();
+        let mut hit_positions = Vec::new();
+        for (i, (k, b)) in keys.iter().zip(found).enumerate() {
+            if let Some(b) = b {
+                hit_positions.push(i as u32);
+                held.insert(k.clone(), b);
+            }
         }
         let metrics = core_metrics();
-        let Some(i) = here else {
-            metrics.cache_block_misses.add(1, &[]);
-            return ObjectQueryStatus::Ready {
-                hits: 0,
-                lease: None,
-                hit_positions: Vec::new(),
-            };
-        };
-        // Touch only the answer; a fetched block evicted since is held here.
-        let block = self
-            .storage
-            .get_blocks_aligned(&keys[i..=i])
-            .pop()
-            .flatten();
-        let Some(block) = block.or_else(|| fetched.get(&keys[i]).cloned()) else {
-            metrics.cache_block_misses.add(1, &[]);
-            return ObjectQueryStatus::Ready {
-                hits: 0,
-                lease: None,
-                hit_positions: Vec::new(),
-            };
-        };
-        metrics.cache_block_hits.add(1, &[]);
-        let held = HashMap::from([(keys[i].clone(), block)]);
+        metrics
+            .cache_block_hits
+            .add(hit_positions.len() as u64, &[]);
+        metrics
+            .cache_block_misses
+            .add((keys.len() - hit_positions.len()) as u64, &[]);
         ObjectQueryStatus::Ready {
-            hits: 1,
-            lease: Some(
+            hits: hit_positions.len(),
+            lease: (!held.is_empty()).then(|| {
                 self.query_leases
-                    .create_objects(instance_id, held, consumers),
-            ),
-            hit_positions: vec![i as u32],
+                    .create_objects(instance_id, held, consumers)
+            }),
+            hit_positions,
         }
     }
 

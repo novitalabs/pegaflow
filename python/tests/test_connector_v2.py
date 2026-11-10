@@ -154,7 +154,7 @@ class FakeRpc:
     def __init__(self, stored: set[tuple[bytes, bytes]]):
         self.stored = stored
         self.loading = 0  # answer Loading this many times first
-        self.members_loading = 0  # same, for latest queries only
+        self.members_loading = 0  # same, for membership queries only
         self.leases: set[bytes] = set()
         self.queries: list[tuple[bool, int]] = []
         self.query_ids: list[str] = []
@@ -169,8 +169,7 @@ class FakeRpc:
         if not prefix and self.members_loading:
             self.members_loading -= 1
             return query_id, Loading()
-        # Membership answers only the last key held.
-        hits = [i for i, k in enumerate(keys) if k in self.stored][-1:]
+        hits = [i for i, k in enumerate(keys) if k in self.stored]
         if prefix:
             n = 0
             while n < len(keys) and keys[n] in self.stored:
@@ -263,7 +262,7 @@ def test_hybrid_hit_asks_vllm_to_checkpoint_where_the_full_prefix_ends(ckpt_bloc
     assert rpc.queries == [(True, 6), (False, 5)]
 
 
-def test_checkpoint_namespaces_ask_latest_and_meet_below_the_lowest():
+def test_checkpoint_namespaces_resume_where_every_one_holds_a_state():
     layout = _layout(FULL4, CKPT4, CKPT4)
     full, a, b = layout.namespaces
     hashes = _hashes(6)
@@ -273,9 +272,9 @@ def test_checkpoint_namespaces_ask_latest_and_meet_below_the_lowest():
     rpc = FakeRpc(stored)
     s = Scheduler(layout, rpc, "inst")
     assert s.get_num_new_matched_tokens(Req("r", 25, hashes), 0) == (8, True)
-    # After the prefix (top = 20), one latest ask each over the points up to
-    # 20 only; then a asks again below 8.
-    assert rpc.queries == [(True, 6), (False, 5), (False, 5), (False, 2)]
+    # After the prefix (top = 20), one membership ask each over the points
+    # up to 20 only; 8 is the highest point both hold.
+    assert rpc.queries == [(True, 6), (False, 5), (False, 5)]
     assert len(rpc.leases) == 3
 
 
