@@ -103,9 +103,8 @@ def test_layout_saves_each_shard_once_per_socket(sockets, savers):
     cfg = _Config([_Group(["f0"], FullAttentionSpec(4, 1024, max_tp_shards=2))])
     (ns,) = build_layout(cfg, Parallel(4, sockets), {}).namespaces
     assert ns.savers == savers
-    # Other savers lay objects out differently: another namespace.
     (one,) = build_layout(cfg, Parallel(4), {}).namespaces
-    assert (ns.namespace == one.namespace) == (savers == one.savers)
+    assert ns.namespace == one.namespace
 
 
 def test_layout_needs_a_full_group():

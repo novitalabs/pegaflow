@@ -54,4 +54,5 @@ Run the E2E suite with `PEGAFLOW_E2E_CONNECTOR=v2` to use it.
 - Repeated queries may prefetch remote objects that are never loaded.
 - No pipeline parallelism: `world_size` is the TP size.
 - No cross-config sharing: objects saved under one TP layout cannot be loaded under another. Same-node deployments always share a config. Cross-node re-layout, if ever needed, belongs in the RDMA layer.
+- Saver ranks and socket placement are not part of the namespace digest. Instances sharing a namespace must use compatible TP layouts, replica counts for each slice, and slot-to-slice ordering. E2E runs must verify and record these before testing cache sharing.
 - DCP is not supported: `interleave_token` is stored but not read.

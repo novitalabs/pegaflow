@@ -162,9 +162,6 @@ def build_layout(kv_cache_config: Any, par: Parallel, identity: dict[str, Any]) 
             "spec": repr(kv_group.kv_cache_spec),
             "kind": [group.kind, bt, group.window_tokens],
             "slices": n_slices,
-            # The savers fix the object's slot layout: placements that save
-            # different copies cannot read each other's objects.
-            "savers": savers,
             "kv_cache_layout": getattr(kv_cache_config, "kv_cache_layout", None),
         }
         blob = json.dumps(doc, sort_keys=True, default=str).encode()
