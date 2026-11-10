@@ -134,12 +134,12 @@ class FakeRpc:
     def __init__(self, stored: set[tuple[bytes, bytes]]):
         self.stored = stored
         self.loading = 0  # answer Loading this many times first
-        self.members_loading = 0  # same, for membership queries only
+        self.members_loading = 0  # same, for latest queries only
         self.leases: set[bytes] = set()
         self.queries: list[tuple[bool, int]] = []
         self.query_ids: list[str] = []
 
-    def query_object(self, instance_id, keys, prefix, query_id, latest=False):
+    def query_object(self, instance_id, keys, prefix, query_id):
         self.queries.append((prefix, len(keys)))
         self.query_ids.append(query_id)
         query_id = query_id or f"q{len(self.query_ids)}"
@@ -149,9 +149,8 @@ class FakeRpc:
         if not prefix and self.members_loading:
             self.members_loading -= 1
             return query_id, Loading()
-        hits = [i for i, k in enumerate(keys) if k in self.stored]
-        if latest:
-            hits = hits[-1:]
+        # Membership answers only the last key held.
+        hits = [i for i, k in enumerate(keys) if k in self.stored][-1:]
         if prefix:
             n = 0
             while n < len(keys) and keys[n] in self.stored:
@@ -211,7 +210,7 @@ def test_hit_loads_only_past_local_and_releases_unused_leases():
     assert loaded == [(0, 12), (0, 13), (0, 14), (1, 23), (1, 24)]
 
 
-def test_window_falls_back_to_every_point_when_the_top_misses():
+def test_window_with_a_hole_asks_again_below_it():
     layout = _layout(FULL4, WIN)
     full, win = layout.namespaces
     hashes = _hashes(6)
@@ -221,7 +220,9 @@ def test_window_falls_back_to_every_point_when_the_top_misses():
     rpc = FakeRpc(stored)
     s = Scheduler(layout, rpc, "inst")
     assert s.get_num_new_matched_tokens(Req("r", 25, hashes), 0) == (12, True)
-    assert rpc.queries == [(True, 6), (False, 2), (False, 5)] and len(rpc.leases) == 2
+    # Block 3 of the top window [3, 5) misses: ask again at 12, the highest
+    # point whose window ends at or below block 3.
+    assert rpc.queries == [(True, 6), (True, 2), (True, 2)] and len(rpc.leases) == 2
 
 
 @pytest.mark.parametrize("ckpt_block,expected", [(3, 16), (0, 4)], ids=["near-top", "deep"])
@@ -248,8 +249,9 @@ def test_checkpoint_namespaces_ask_latest_and_meet_below_the_lowest():
     rpc = FakeRpc(stored)
     s = Scheduler(layout, rpc, "inst")
     assert s.get_num_new_matched_tokens(Req("r", 25, hashes), 0) == (8, True)
-    # One latest ask each over the points <= 20, then a asks again below 8.
-    assert rpc.queries == [(True, 6), (False, 5), (False, 5), (False, 2)]
+    # With the prefix, one latest ask each over every point up to the prompt
+    # end; then a asks again below 8.
+    assert rpc.queries == [(True, 6), (False, 6), (False, 6), (False, 2)]
     assert len(rpc.leases) == 3
 
 
@@ -262,13 +264,15 @@ def test_loading_polls_only_what_is_still_loading():
     rpc.loading, rpc.members_loading = 1, 2
     s = Scheduler(layout, rpc, "inst")
     req = Req("r", 25, hashes)
-    for _ in range(3):
+    # The checkpoint asks with the prefix, so their fetches overlap: two
+    # waits, not three.
+    for _ in range(2):
         assert s.get_num_new_matched_tokens(req, 0) == (None, False)
     assert s.get_num_new_matched_tokens(req, 0) == (16, True)
     # The prefix answer is kept while the checkpoint query loads, and each
     # namespace polls under one query id, so the server's fetch can finish.
-    assert [prefix for prefix, _ in rpc.queries] == [True, True, False, False, False]
-    assert rpc.query_ids == ["", "q1", "", "q3", "q3"] and len(rpc.leases) == 2
+    assert [prefix for prefix, _ in rpc.queries] == [True, False, True, False, False]
+    assert rpc.query_ids == ["", "", "q1", "q2", "q2"] and len(rpc.leases) == 2
     # One prefetch, as v1 counts them: the 4 full blocks and 1 checkpoint load.
     stats = s.take_stats()
     assert stats["prefetch_blocks"] == [5] and "pending_prefetches" not in stats

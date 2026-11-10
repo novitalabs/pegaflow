@@ -464,19 +464,13 @@ impl StorageEngine {
         self.read_cache.peek_blocks(keys)
     }
 
-    /// Start fetching `keys` of one namespace for `id`, each on its own;
-    /// see [`PrefetchScheduler::start_members`].
-    pub(crate) fn start_members(&self, id: &str, keys: Vec<BlockKey>) -> bool {
-        self.prefetch.start_members(id, keys)
+    /// Start fetching the last of `keys` (one namespace) a peer or SSD holds
+    /// for `id`; see [`PrefetchScheduler::start_latest`].
+    pub(crate) fn start_latest(&self, id: &str, keys: Vec<BlockKey>) -> bool {
+        self.prefetch.start_latest(id, keys)
     }
 
-    /// Index of the last of `keys` on SSD or at a peer; see
-    /// [`PrefetchScheduler::latest_elsewhere`].
-    pub(crate) async fn latest_elsewhere(&self, id: &str, keys: &[BlockKey]) -> Option<usize> {
-        self.prefetch.latest_elsewhere(id, keys).await
-    }
-
-    /// Poll the fetch [`Self::start_members`] started for `id`.
+    /// Poll the fetch [`Self::start_latest`] started for `id`.
     pub(crate) async fn poll_members(&self, id: &str) -> MembersPoll {
         self.prefetch.poll_members(&self.read_cache, id).await
     }

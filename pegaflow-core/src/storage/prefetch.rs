@@ -23,9 +23,6 @@ use super::tier_attribution::{
 
 const REMOTE_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const REMOTE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
-/// A latest-only membership query asks the MetaServer inline; past this it
-/// answers from what is here.
-const LATEST_PLAN_TIMEOUT: Duration = Duration::from_millis(200);
 
 #[cfg(feature = "rdma")]
 #[derive(Clone)]
@@ -271,10 +268,11 @@ impl PrefetchScheduler {
         }
     }
 
-    /// Start fetching the `keys` of one namespace for `id`, peers first and
-    /// then SSD, each key on its own. False when nothing can serve them;
-    /// true as well when a fetch of `id` already runs.
-    pub(super) fn start_members(&self, id: &str, keys: Vec<BlockKey>) -> bool {
+    /// Start fetching, for `id`, the last of `keys` (one namespace, ascending)
+    /// that a peer or SSD holds: one MetaServer membership query, then a
+    /// fetch of that key alone. False when nothing can serve them; true as
+    /// well when a fetch of `id` already runs.
+    pub(super) fn start_latest(&self, id: &str, keys: Vec<BlockKey>) -> bool {
         if keys.is_empty() || (self.rdma_fetch.is_none() && self.ssd_store.is_none()) {
             return false;
         }
@@ -299,7 +297,7 @@ impl PrefetchScheduler {
             max_prefetch_blocks: self.max_prefetch_blocks,
         };
         let task_id = id.to_string();
-        let handle = tokio::spawn(async move { run_members_task(deps, task_id, keys).await });
+        let handle = tokio::spawn(async move { run_latest_task(deps, task_id, keys).await });
         state.members.insert(
             id.to_string(),
             MembersEntry {
@@ -308,38 +306,6 @@ impl PrefetchScheduler {
             },
         );
         true
-    }
-
-    /// Index of the last of `keys` (one namespace) on SSD or at a peer that
-    /// may still serve `id`. Asks the MetaServer inline, bounded by
-    /// [`LATEST_PLAN_TIMEOUT`]; a slow or failed answer counts as none there.
-    pub(super) async fn latest_elsewhere(&self, id: &str, keys: &[BlockKey]) -> Option<usize> {
-        if keys.is_empty() {
-            return None;
-        }
-        let on_ssd = self
-            .ssd_store
-            .as_ref()
-            .and_then(|ssd| ssd.contains_keys(keys).iter().rposition(|&held| held));
-        let rdma = self
-            .rdma_fetch
-            .as_ref()
-            .filter(|_| !self.state.lock().failed_remote.contains_key(id))
-            .cloned();
-        let remote = match rdma {
-            Some(rdma) => {
-                let hashes: Vec<Vec<u8>> = keys.iter().map(|k| k.hash.clone()).collect();
-                let ask = rdma.last_member(&keys[0].namespace, &hashes);
-                tokio::time::timeout(LATEST_PLAN_TIMEOUT, ask)
-                    .await
-                    .unwrap_or_else(|_| {
-                        warn!("MetaServer latest-member query timed out: id={id}");
-                        None
-                    })
-            }
-            None => None,
-        };
-        on_ssd.max(remote)
     }
 
     /// Poll the membership fetch of `id`. A finished one enters the read
@@ -841,6 +807,31 @@ async fn run_prefetch_task(deps: PrefetchTaskDeps, input: PrefetchTaskInput) -> 
 
     record_tier_attribution(total, hit, 0, None, emit_tier_metrics);
     build_ready_result(prefix_blocks, total, None, 0, &[], Vec::new())
+}
+
+/// The last of `keys` a peer or SSD holds, fetched alone.
+async fn run_latest_task(deps: PrefetchTaskDeps, id: String, keys: Vec<BlockKey>) -> MembersResult {
+    let on_ssd = deps.ssd_store.as_ref().and_then(|ssd| {
+        ssd.contains_keys(keys.iter())
+            .iter()
+            .rposition(|&held| held)
+    });
+    let remote = match &deps.rdma_fetch {
+        Some(rdma) => {
+            let hashes: Vec<Vec<u8>> = keys.iter().map(|k| k.hash.clone()).collect();
+            rdma.last_member(&keys[0].namespace, &hashes).await
+        }
+        None => None,
+    };
+    let Some(last) = on_ssd.max(remote) else {
+        return MembersResult::default();
+    };
+    let deps = PrefetchTaskDeps {
+        // Only a peer holding the last key is worth asking for it.
+        rdma_fetch: deps.rdma_fetch.filter(|_| remote == Some(last)),
+        ..deps
+    };
+    run_members_task(deps, id, vec![keys[last].clone()]).await
 }
 
 async fn run_members_task(

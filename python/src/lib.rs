@@ -694,17 +694,16 @@ impl EngineRpcClient {
     /// Args:
     ///     instance_id: Model instance ID
     ///     keys: `(namespace, prefix)` pairs, all of one namespace
-    ///     prefix_search: Prefix or membership semantics
+    ///     prefix_search: Leading hits (True) or only the last key held
+    ///         anywhere, fetching only that one (False)
     ///     query_id: Id of the query being polled; empty for a new one
-    ///     latest: Membership only: answer just the last key held anywhere,
-    ///         fetching only that one
     ///
     /// Returns:
     ///     `(query_id, QueryLoading | QueryReady)`
     ///
     /// Raises:
     ///     ValueError: If the server rejects the query.
-    #[pyo3(signature = (instance_id, keys, prefix_search, query_id = String::new(), latest = false))]
+    #[pyo3(signature = (instance_id, keys, prefix_search, query_id = String::new()))]
     fn query_object(
         &self,
         py: Python<'_>,
@@ -712,14 +711,12 @@ impl EngineRpcClient {
         keys: Vec<PyObjectKey>,
         prefix_search: bool,
         query_id: String,
-        latest: bool,
     ) -> PyResult<(String, Py<PyAny>)> {
         let request = QueryObjectRequest {
             instance_id,
             keys: keys.into_iter().map(object_key).collect(),
             prefix_search,
             query_id,
-            latest_only: latest,
         };
         let resp = self.call(py, "query_object", |mut c| async move {
             Ok(c.query_object(request).await?.into_inner())

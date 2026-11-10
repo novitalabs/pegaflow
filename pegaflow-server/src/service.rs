@@ -1237,7 +1237,6 @@ impl Engine for GrpcEngineService {
             keys,
             prefix_search,
             query_id,
-            latest_only,
         } = request.into_inner();
         trace_root!("rpc.query_object", root, || {
             [
@@ -1247,7 +1246,7 @@ impl Engine for GrpcEngineService {
             ]
         });
         let detail = format!(
-            "instance_id={instance_id} keys={} prefix_search={prefix_search} latest_only={latest_only}",
+            "instance_id={instance_id} keys={} prefix_search={prefix_search}",
             keys.len()
         );
         let fut = async {
@@ -1257,7 +1256,7 @@ impl Engine for GrpcEngineService {
                 .collect::<Result<Vec<_>, Status>>()?;
             let query_id = (!query_id.is_empty()).then_some(query_id.as_str());
             self.engine
-                .query_object(&instance_id, query_id, &keys, prefix_search, latest_only)
+                .query_object(&instance_id, query_id, &keys, prefix_search)
                 .await
                 .map_err(Self::map_engine_error)
         };

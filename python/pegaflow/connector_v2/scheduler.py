@@ -3,27 +3,30 @@
 vLLM-free: the connector passes plain values in and the server client is
 duck-typed (``query_object`` / ``release``), so unit tests drive it with fakes.
 
-Lookup, per request, with ``local`` = vLLM's own hit:
+Lookup, per request, with ``local`` = vLLM's own hit. A query is a prefix
+query (the leading keys held) or, for a checkpoint, a latest query (only the
+last key held, in memory, on SSD or at a peer; the server fetches only that
+one).
 
-1. Every full namespace gets a prefix query from block ``local / bt``. The
-   shortest answer bounds every hit (``top``).
-2. Window and checkpoint namespaces get a membership query over the blocks
-   the resume points ``<= top`` need. A checkpoint namespace asks for the
-   latest state held anywhere at those points (``latest``): the server
-   answers at once when it is in memory and fetches only it otherwise. When
-   checkpoint namespaces disagree, the ones above the lowest ask again below
-   it until they meet. Windows ask the top point first; if no hit reaches
-   it, they ask every point back to the local hit, as v1 does because window
-   hits are not monotone. Blocks below the local hit are on the GPU already
-   and count as present.
+1. Every full namespace gets a prefix query from block ``local / bt``; the
+   shortest answer bounds every hit (``top``). In the same pass every
+   checkpoint namespace asks for its latest state at the resume points up to
+   the prompt end, so their fetches overlap the prefix fetch.
+2. A checkpoint above the lowest of ``top`` and the other checkpoints asks
+   again below it, until they meet. A window namespace asks for the blocks
+   the top point needs as a prefix query; one with a hole asks again at the
+   highest lower point whose window ends below the hole, as v1 falls back
+   when window hits are not monotone. Blocks below the local hit are on the GPU already and count
+   as present.
 3. ``semantics.resolve`` picks ``p``; only blocks past the local hit load.
 
 While the server fetches from SSD or peers a query answers Loading and vLLM
 asks again next step. Every namespace of a pass is asked before the lookup
-waits, so their fetches overlap: one wait per pass, not one per namespace. As v1 keeps a probe per request, each namespace's
-answer is kept until the lookup ends, so a poll only re-asks what is still
-loading, under the same query id and keys. There is no wait budget: as in v1
-the request waits until the server answers.
+waits, so their fetches overlap: one wait per pass, not one per namespace. As
+v1 keeps a probe per request, each namespace's answer is kept until the
+lookup ends, so a poll only re-asks what is still loading, under the same
+query id and keys. There is no wait budget: as in v1 the request waits until
+the server answers.
 
 Loads are always asynchronous. A plan that cannot load (vLLM trimmed the hit
 off a resume point or handed a null block) is a failed receive like a failed
@@ -100,7 +103,6 @@ class _Ask:
 
     keys: list[bytes]
     prefix: bool
-    latest: bool = False
     hits: list[int] | None = None
     lease: bytes | None = None
 
@@ -211,13 +213,7 @@ class Scheduler:
         return hit.p - local, True
 
     def _query(
-        self,
-        rec: _Req,
-        i: int,
-        keys: list[bytes],
-        prefix: bool,
-        phase: int = 0,
-        latest: bool = False,
+        self, rec: _Req, i: int, keys: list[bytes], prefix: bool, phase: int = 0
     ) -> tuple[list[int], bytes | None]:
         """Hit positions into ``keys`` and the lease; raises ``_Loading``.
 
@@ -226,13 +222,12 @@ class Scheduler:
         positions of the keys it was asked), then discarded, as v1 drops a
         drifted probe.
         """
-        want = (keys, prefix, latest)
         ask = rec.asks.get((i, phase))
-        if ask is not None and ask.hits is not None and (ask.keys, ask.prefix, ask.latest) != want:
+        if ask is not None and ask.hits is not None and (ask.keys, ask.prefix) != (keys, prefix):
             self._release([ask.lease] if ask.lease else [])
             ask = None
         if ask is None:
-            ask = rec.asks[(i, phase)] = _Ask(list(keys), prefix, latest)
+            ask = rec.asks[(i, phase)] = _Ask(list(keys), prefix)
         if ask.hits is None:
             ns = self._layout.namespaces[i].namespace
             query_id, ans = self._rpc.query_object(
@@ -240,7 +235,6 @@ class Scheduler:
                 [(ns, k) for k in ask.keys],
                 ask.prefix,
                 rec.query_ids.get(i, ""),
-                latest=ask.latest,
             )
             if query_id:
                 rec.query_ids[i] = query_id
@@ -250,11 +244,15 @@ class Scheduler:
             ask.hits, ask.lease = hits, (ans.lease or None)
             if hits and not ask.lease:
                 raise RuntimeError(f"namespace {i}: {len(hits)} hits without a lease")
-        if (ask.keys, ask.prefix, ask.latest) != want:
-            return self._query(rec, i, keys, prefix, phase, latest)
+        if (ask.keys, ask.prefix) != (keys, prefix):
+            return self._query(rec, i, keys, prefix, phase)
         return ask.hits, ask.lease
 
-    def _members(
+    def _on_gpu(self, i: int, keys: list[bytes], local: int) -> frozenset[int]:
+        bt = self._layout.namespaces[i].group.block_tokens
+        return frozenset(range(min(local // bt, len(keys))))
+
+    def _latest(
         self,
         rec: _Req,
         i: int,
@@ -264,19 +262,40 @@ class Scheduler:
         leases: dict[int, bytes],
         phase: int,
     ) -> frozenset[int]:
-        """Blocks of namespace ``i`` present for ``points``, GPU ones included;
-        a checkpoint namespace asks only for its latest state."""
+        """Checkpoint namespace ``i``: the latest state held at ``points``,
+        GPU blocks included."""
         g = self._layout.namespaces[i].group
-        on_gpu = frozenset(range(min(local // g.block_tokens, len(keys))))
+        on_gpu = self._on_gpu(i, keys, local)
         want = sorted({b for p in points for b in sem.needed(g, p)} - on_gpu)
         want = [b for b in want if b < len(keys)]
         if not want:
             return on_gpu
-        latest = g.kind == sem.CHECKPOINT
-        hits, lease = self._query(rec, i, [keys[b] for b in want], False, phase, latest)
+        hits, lease = self._query(rec, i, [keys[b] for b in want], False, phase)
         if lease:
             leases[i] = lease
         return on_gpu | {want[h] for h in hits}
+
+    def _window(
+        self,
+        rec: _Req,
+        i: int,
+        keys: list[bytes],
+        local: int,
+        start: int,
+        end: int,
+        leases: dict[int, bytes],
+        phase: int,
+    ) -> frozenset[int]:
+        """Window namespace ``i``: the blocks of ``[start, end)`` held from
+        ``start`` on, GPU blocks included."""
+        on_gpu = self._on_gpu(i, keys, local)
+        start, end = max(start, len(on_gpu)), min(end, len(keys))
+        if start >= end:
+            return on_gpu
+        hits, lease = self._query(rec, i, keys[start:end], True, phase)
+        if lease:
+            leases[i] = lease
+        return on_gpu | frozenset(range(start, start + len(hits)))
 
     def _lookup(self, rec: _Req, local: int) -> _Hit | None:
         request = rec.request
@@ -300,6 +319,9 @@ class Scheduler:
         leases: dict[int, bytes] = {}
         present: list[frozenset[int]] = [frozenset()] * len(nss)
         top = cap
+        ckpts = [i for i, ns in enumerate(nss) if ns.group.kind == sem.CHECKPOINT]
+        windows = [i for i, ns in enumerate(nss) if ns.group.kind == sem.WINDOW]
+        ahead = [p for p in sem.candidates(groups, cap, n_tokens) if p > local]
         pending = _Pass()
         for i, ns in enumerate(nss):
             if ns.group.kind != sem.FULL:
@@ -313,46 +335,67 @@ class Scheduler:
                 leases[i] = lease
             present[i] = frozenset(range(start + len(hits)))
             top = min(top, (start + len(hits)) * ns.group.block_tokens)
+        for i in ckpts:
+            with pending:
+                present[i] = self._latest(rec, i, keys[i], local, ahead, leases, 0)
         pending.wait()
         if self._has_checkpoint:
             rec.junction = top
-        points = [p for p in sem.candidates(groups, top, n_tokens) if p > local]
+        points = [p for p in ahead if p <= top]
         if not points:
             return None
-        windows = [i for i, ns in enumerate(nss) if ns.group.kind == sem.WINDOW]
-        for i, ns in enumerate(nss):
-            if ns.group.kind == sem.FULL:
-                continue
-            probe = points if ns.group.kind == sem.CHECKPOINT else points[:1]
-            with pending:
-                present[i] = self._members(rec, i, keys[i], local, probe, leases, 0)
-        pending.wait()
-        ckpts = [i for i, ns in enumerate(nss) if ns.group.kind == sem.CHECKPOINT]
+
         phase = 1
-        while len(ckpts) > 1:
-            # Each answer is one state; the namespaces above the lowest ask
-            # again below it. The cap only falls, so this ends.
+        while True:
+            # Each checkpoint answer is one state; the ones above the lowest
+            # of top and the others ask again below it. The bound only
+            # falls, so this ends.
             at = {i: self._ckpt_point(i, present[i], local) for i in ckpts}
-            cap = min(at.values())
-            above = [i for i in ckpts if at[i] > cap]
+            bound = min([top, *at.values()])
+            above = [i for i in ckpts if at[i] > bound]
             if not above:
                 break
-            below = [p for p in points if p <= cap]
+            below = [p for p in points if p <= bound]
             for i in above:
                 leases.pop(i, None)
                 with pending:
-                    present[i] = self._members(rec, i, keys[i], local, below, leases, phase)
+                    present[i] = self._latest(rec, i, keys[i], local, below, leases, phase)
             pending.wait()
             phase += 1
-        if windows and sem.resolve(groups, present, n_tokens) < points[0]:
-            # As v1: an earlier point needs another window, so ask every
-            # point back to the local hit. This answer replaces the first,
-            # whose lease the lookup's end releases.
+        # Windows ask the blocks of the highest point left. As v1 falls back
+        # when window hits are not monotone, a window with a hole asks again
+        # at the highest lower point whose window ends below the hole.
+        points = [q for q in points if q <= bound]
+        at_p = points[0] if windows and points else 0
+        phase = 0
+        while at_p:
             for i in windows:
+                need = sem.needed(nss[i].group, at_p)
                 leases.pop(i, None)
                 with pending:
-                    present[i] = self._members(rec, i, keys[i], local, points, leases, 1)
+                    present[i] = self._window(
+                        rec, i, keys[i], local, need.start, need.stop, leases, phase
+                    )
             pending.wait()
+            holes = {}
+            for i in windows:
+                hole = next(
+                    (b for b in sem.needed(nss[i].group, at_p) if b not in present[i]), None
+                )
+                if hole is not None:
+                    holes[i] = hole
+            if not holes:
+                break
+            at_p = next(
+                (
+                    q
+                    for q in points
+                    if q < at_p
+                    and all(sem.needed(nss[i].group, q).stop <= h for i, h in holes.items())
+                ),
+                0,
+            )
+            phase += 1
 
         p = sem.resolve(groups, present, n_tokens)
         p = max(0, min(int(self._policy.accept(p)), p))
