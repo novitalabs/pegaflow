@@ -139,7 +139,7 @@ class FakeRpc:
         self.queries: list[tuple[bool, int]] = []
         self.query_ids: list[str] = []
 
-    def query_object(self, instance_id, keys, prefix, query_id):
+    def query_object(self, instance_id, keys, prefix, query_id, latest=False):
         self.queries.append((prefix, len(keys)))
         self.query_ids.append(query_id)
         query_id = query_id or f"q{len(self.query_ids)}"
@@ -150,6 +150,8 @@ class FakeRpc:
             self.members_loading -= 1
             return query_id, Loading()
         hits = [i for i, k in enumerate(keys) if k in self.stored]
+        if latest:
+            hits = hits[-1:]
         if prefix:
             n = 0
             while n < len(keys) and keys[n] in self.stored:
@@ -234,6 +236,21 @@ def test_hybrid_hit_asks_vllm_to_checkpoint_where_the_full_prefix_ends(ckpt_bloc
     # below, and have vLLM commit a checkpoint at 20 for the next request.
     assert s.get_num_new_matched_tokens(req, 0) == (expected, True)
     assert req.shared_prefix_boundary == 20
+
+
+def test_checkpoint_namespaces_ask_latest_and_meet_below_the_lowest():
+    layout = _layout(FULL4, CKPT4, CKPT4)
+    full, a, b = layout.namespaces
+    hashes = _hashes(6)
+    stored = {(full.namespace, h) for h in hashes[:5]}
+    # a holds the states at 16 and 8, b only the one at 8.
+    stored |= {(a.namespace, hashes[3]), (a.namespace, hashes[1]), (b.namespace, hashes[1])}
+    rpc = FakeRpc(stored)
+    s = Scheduler(layout, rpc, "inst")
+    assert s.get_num_new_matched_tokens(Req("r", 25, hashes), 0) == (8, True)
+    # One latest ask each over the points <= 20, then a asks again below 8.
+    assert rpc.queries == [(True, 6), (False, 5), (False, 5), (False, 2)]
+    assert len(rpc.leases) == 3
 
 
 def test_loading_polls_only_what_is_still_loading():

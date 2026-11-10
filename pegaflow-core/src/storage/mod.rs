@@ -470,6 +470,12 @@ impl StorageEngine {
         self.prefetch.start_members(id, keys)
     }
 
+    /// Index of the last of `keys` on SSD or at a peer; see
+    /// [`PrefetchScheduler::latest_elsewhere`].
+    pub(crate) async fn latest_elsewhere(&self, id: &str, keys: &[BlockKey]) -> Option<usize> {
+        self.prefetch.latest_elsewhere(id, keys).await
+    }
+
     /// Poll the fetch [`Self::start_members`] started for `id`.
     pub(crate) async fn poll_members(&self, id: &str) -> MembersPoll {
         self.prefetch.poll_members(&self.read_cache, id).await

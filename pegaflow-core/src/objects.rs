@@ -740,14 +740,17 @@ impl PegaEngine {
     /// `wait_for_full_prefix`: the leading keys in memory, or `Loading` while
     /// SSD and peers bring more in. Otherwise every key stands on its own:
     /// keys not in memory are fetched from peers and SSD, and the answer is
-    /// `Loading` until that ends. Poll with the same `query_id` and keys; a
-    /// `None` id gets a fresh one. Returns the id and the answer.
+    /// `Loading` until that ends. With `latest` (membership only) the answer
+    /// holds just the last key held anywhere: `Ready` at once when that one
+    /// is in memory, else it alone is fetched. Poll with the same `query_id`
+    /// and keys; a `None` id gets a fresh one. Returns the id and the answer.
     pub async fn query_object(
         &self,
         instance_id: &str,
         query_id: Option<&str>,
         keys: &[ObjectKey],
         prefix_search: bool,
+        latest: bool,
     ) -> Result<(String, ObjectQueryStatus), EngineError> {
         let query_id = query_id.map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_string);
         let Some(first) = keys.first() else {
@@ -772,6 +775,9 @@ impl PegaEngine {
         let block_keys: Vec<BlockKey> = keys.iter().map(ObjectKey::block_key).collect();
         let status = if prefix_search {
             self.query_object_prefix(instance_id, &tag, &block_keys, consumers)
+                .await
+        } else if latest {
+            self.query_object_latest(instance_id, &tag, &block_keys, consumers)
                 .await
         } else {
             self.query_object_members(instance_id, &tag, &block_keys, consumers)
@@ -807,6 +813,72 @@ impl PegaEngine {
                     .create_objects(instance_id, held, consumers)
             }),
             hit_positions: Vec::new(),
+        }
+    }
+
+    /// Membership of only the last key held in memory, on SSD or at a peer.
+    async fn query_object_latest(
+        &self,
+        instance_id: &str,
+        tag: &str,
+        keys: &[BlockKey],
+        consumers: usize,
+    ) -> ObjectQueryStatus {
+        let (polled, fetched): (bool, HashMap<BlockKey, Arc<SealedBlock>>) =
+            match self.storage.poll_members(tag).await {
+                MembersPoll::Loading => return ObjectQueryStatus::Loading,
+                MembersPoll::Done(fetched) => (true, fetched.into_iter().collect()),
+                MembersPoll::Idle => (false, HashMap::new()),
+            };
+        let here = self
+            .storage
+            .peek_blocks(keys)
+            .into_iter()
+            .zip(keys)
+            .rposition(|(b, k)| b.is_some() || fetched.contains_key(k));
+        if !polled {
+            // Only a later key held elsewhere is worth a fetch.
+            let after = here.map_or(0, |i| i + 1);
+            if let Some(j) = self.storage.latest_elsewhere(tag, &keys[after..]).await
+                && self
+                    .storage
+                    .start_members(tag, vec![keys[after + j].clone()])
+            {
+                return ObjectQueryStatus::Loading;
+            }
+        }
+        let metrics = core_metrics();
+        let Some(i) = here else {
+            metrics.cache_block_misses.add(1, &[]);
+            return ObjectQueryStatus::Ready {
+                hits: 0,
+                lease: None,
+                hit_positions: Vec::new(),
+            };
+        };
+        // Touch only the answer; a fetched block evicted since is held here.
+        let block = self
+            .storage
+            .get_blocks_aligned(&keys[i..=i])
+            .pop()
+            .flatten();
+        let Some(block) = block.or_else(|| fetched.get(&keys[i]).cloned()) else {
+            metrics.cache_block_misses.add(1, &[]);
+            return ObjectQueryStatus::Ready {
+                hits: 0,
+                lease: None,
+                hit_positions: Vec::new(),
+            };
+        };
+        metrics.cache_block_hits.add(1, &[]);
+        let held = HashMap::from([(keys[i].clone(), block)]);
+        ObjectQueryStatus::Ready {
+            hits: 1,
+            lease: Some(
+                self.query_leases
+                    .create_objects(instance_id, held, consumers),
+            ),
+            hit_positions: vec![i as u32],
         }
     }
 

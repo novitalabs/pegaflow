@@ -306,13 +306,16 @@ class EngineRpcClient:
         keys: list[tuple[bytes, bytes]],
         prefix_search: bool,
         query_id: str = "",
+        latest: bool = False,
     ) -> tuple[str, QueryLoading | QueryReady]:
         """RPC V2: look up objects of one namespace.
 
         ``prefix_search=True`` counts consecutive hits from ``keys[0]``.
         ``False`` reports every hit position and fetches misses from SSD
-        and peers first. While fetching, the answer is ``QueryLoading``:
-        poll again with the returned query id and the same keys.
+        and peers first. With ``latest`` (membership only), only the last key
+        held in memory, on SSD or at a peer is reported, and only it is
+        fetched. While fetching, the answer is ``QueryLoading``: poll again
+        with the returned query id and the same keys.
 
         Returns:
             ``(query_id, outcome)``.

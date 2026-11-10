@@ -32,6 +32,7 @@ A lease is consumed once per `LoadObjects` call that carries it and is released 
 
 - `prefix_search = true` works like v1 `QueryPrefetch` without `wait_for_full_prefix`. It counts consecutive hits from `keys[0]` and prefetches misses from SSD or peers.
 - `prefix_search = false` is a membership query. Unlike v1, it fetches every local miss it can find on SSD or on peers (MetaServer `members` lookup, then RDMA). It answers `Ready` only after those fetches finish. `hit_positions` lists the hit indices into `keys`.
+- `latest_only = true` (membership only, keys ascending) answers just the last key held in memory, on SSD or at a peer. It asks SSD and the MetaServer inline (bounded at 200 ms). When the last one is in memory the answer is `Ready` at once; otherwise only that key is fetched. Checkpoint groups use it: a resume needs one state, and the latest one below the prefix bound is the best.
 
 Poll a `Loading` answer with the returned `query_id` and the same keys.
 
@@ -41,7 +42,7 @@ Poll a `Loading` answer with the returned `query_id` and the same keys.
 
 - Each vLLM cache group is one namespace. The 32-byte namespace hashes the model identity and the group spec. The object prefix is the vLLM block hash of the group's last token block.
 - `semantics.py` says what resuming at token `p` needs from each group: every block for full attention, the last `W - 1` tokens for a window, and the one state at `p` for a checkpoint. `resolve` picks the largest `p` that every group can back.
-- Full groups take a prefix query from vLLM's local hit. Window and checkpoint groups take one membership query over the blocks that the largest candidate resume points need.
+- Full groups take a prefix query from vLLM's local hit. Window groups take a membership query over the blocks that the largest candidate resume points need. Checkpoint groups take a `latest_only` query over every candidate point; when they disagree, the ones above the lowest ask again below it.
 - Every load is asynchronous. A failed load is reported as a failed receive, and vLLM recomputes the request, so run with `kv_load_failure_policy=recompute`.
 - Saves follow `semantics.saveable`. Mamba states are saved only from vLLM's `boundary_state_offloads`. A saved block stays pinned in vLLM's block pool until every rank reports the save done.
 - vLLM 0.32 keeps a rank's whole KV cache in one allocation, so each rank registers one region. The span of block `b` in layer `l` is `offset_l + b × block_stride_l` with length `page_size_bytes`.

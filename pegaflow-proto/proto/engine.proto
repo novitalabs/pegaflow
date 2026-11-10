@@ -350,6 +350,10 @@ message QueryObjectRequest {
   // Optional; the server generates one when empty. Poll a Loading answer
   // with the same query_id and keys.
   string query_id = 4;
+  // Membership only: answer just the last key held in memory, on SSD or at
+  // a peer (keys ascending). Ready at once when that one is in memory, else
+  // only it is fetched.
+  bool latest_only = 5;
 }
 
 message QueryObjectResponse {

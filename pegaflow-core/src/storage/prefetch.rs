@@ -23,6 +23,9 @@ use super::tier_attribution::{
 
 const REMOTE_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const REMOTE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// A latest-only membership query asks the MetaServer inline; past this it
+/// answers from what is here.
+const LATEST_PLAN_TIMEOUT: Duration = Duration::from_millis(200);
 
 #[cfg(feature = "rdma")]
 #[derive(Clone)]
@@ -68,6 +71,13 @@ impl RdmaFetch {
         Some((found, blocks))
     }
 
+    /// Index of the last of `hashes` a peer holds, from one MetaServer
+    /// membership query; no fetch.
+    async fn last_member(&self, namespace: &str, hashes: &[Vec<u8>]) -> Option<usize> {
+        let (found, _plan) = self.0.query_members(namespace, hashes).await?;
+        found.last().copied()
+    }
+
     /// What peers serve of `hashes`, each on its own: one MetaServer
     /// membership query and one fetch per holder for all of them. Also
     /// returns how many the MetaServer said peers hold.
@@ -88,6 +98,10 @@ impl RdmaFetch {
 
 #[cfg(not(feature = "rdma"))]
 impl RdmaFetch {
+    async fn last_member(&self, _namespace: &str, _hashes: &[Vec<u8>]) -> Option<usize> {
+        None
+    }
+
     async fn fetch_members(
         &self,
         _req_id: &str,
@@ -294,6 +308,38 @@ impl PrefetchScheduler {
             },
         );
         true
+    }
+
+    /// Index of the last of `keys` (one namespace) on SSD or at a peer that
+    /// may still serve `id`. Asks the MetaServer inline, bounded by
+    /// [`LATEST_PLAN_TIMEOUT`]; a slow or failed answer counts as none there.
+    pub(super) async fn latest_elsewhere(&self, id: &str, keys: &[BlockKey]) -> Option<usize> {
+        if keys.is_empty() {
+            return None;
+        }
+        let on_ssd = self
+            .ssd_store
+            .as_ref()
+            .and_then(|ssd| ssd.contains_keys(keys).iter().rposition(|&held| held));
+        let rdma = self
+            .rdma_fetch
+            .as_ref()
+            .filter(|_| !self.state.lock().failed_remote.contains_key(id))
+            .cloned();
+        let remote = match rdma {
+            Some(rdma) => {
+                let hashes: Vec<Vec<u8>> = keys.iter().map(|k| k.hash.clone()).collect();
+                let ask = rdma.last_member(&keys[0].namespace, &hashes);
+                tokio::time::timeout(LATEST_PLAN_TIMEOUT, ask)
+                    .await
+                    .unwrap_or_else(|_| {
+                        warn!("MetaServer latest-member query timed out: id={id}");
+                        None
+                    })
+            }
+            None => None,
+        };
+        on_ssd.max(remote)
     }
 
     /// Poll the membership fetch of `id`. A finished one enters the read
