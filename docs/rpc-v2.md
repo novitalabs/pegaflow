@@ -22,7 +22,7 @@ Business errors come back in `ResponseStatus status` (`ok = false`). The gRPC st
 
 One rank's slice of one layer is `L = local_hidden × block_size` bytes. A layer has `S = bytes_per_block / L` slices, and rank `r` holds slice `r × S / world_size`. GQA over TP4 with 4 KV heads gives `S = 4`, one slice per rank. MLA gives `S = 1`, so every rank holds the same slice.
 
-An object has one slot per (saver rank, layer). It seals, becoming visible to queries, SSD and the MetaServer, once every saver has written every layer. When two savers map to the same slice (MLA with `saver_rank = [0, 4]`), the server keeps both copies. A load reads the copy on its own NUMA node, else on its own socket, else the first. A saver spreads its objects, by prefix, over the NUMA nodes of the ranks that read its copy: with MLA over TP8 and `saver_rank = [0]`, rank 0's objects fill the pinned pool of all eight ranks' nodes instead of only its own. The server learns each rank's node at registration; the protocol is unchanged.
+An object has one slot per (saver rank, layer). It seals, becoming visible to queries, SSD and the MetaServer, once every saver has written every layer. When two savers map to the same slice (MLA with `saver_rank = [0, 4]`), the server keeps both copies, each on its writer's NUMA node. A load reads the copy on the loading rank's NUMA node when there is one.
 
 Spans of one object list every layer of its namespace, in `layer_names` order, and must add up to `len(layer_names) × L`. Each span element is 16 bytes, `offset` then `len` as little-endian u64, with offsets counted from the start of the region's allocation.
 
@@ -53,6 +53,7 @@ Run the E2E suite with `PEGAFLOW_E2E_CONNECTOR=v2` to use it.
 
 - An RDMA fetch moves an object slot by slot, so both copies of a hybrid MLA model cross the network. The result is correct, but the traffic is doubled.
 - Repeated queries may prefetch remote objects that are never loaded.
+- Objects go to the saver's NUMA node only. With one copy of a replicated slice (MLA), the pinned pools of the other ranks' nodes stay unused. This matters on hosts with several NUMA nodes per socket; v1 stripes MLA saves over every rank instead.
 - No pipeline parallelism: `world_size` is the TP size.
 - No cross-config sharing: objects saved under one TP layout cannot be loaded under another. Same-node deployments always share a config. Cross-node re-layout, if ever needed, belongs in the RDMA layer.
 - Saver ranks and socket placement are not part of the namespace digest. Instances sharing a namespace must use compatible TP layouts, replica counts for each slice, and slot-to-slice ordering. E2E runs must verify and record these before testing cache sharing.

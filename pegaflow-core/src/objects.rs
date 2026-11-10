@@ -9,13 +9,10 @@
 //! slices, and rank `r` holds slice `r x S / world_size`.
 //!
 //! Only the ranks in `saver_rank` save. The engine cuts their bytes into one
-//! slot per `(saver, layer)` and hands them to the insert worker like a KV
-//! save; the object seals once every slot arrived. Two savers of one slice
-//! keep two copies, and a load reads the nearest: its own NUMA node, else its
-//! own socket, else the first. A saver spreads its objects, by prefix, over
-//! the NUMA nodes of the ranks that read its copy (see [`Shape::spread`]), so
-//! a replicated slice (MLA) fills the pinned pool of every such node instead
-//! of only the saver's.
+//! slot per `(saver, layer)`, in pinned memory on the saver's NUMA node, and
+//! hands them to the insert worker like a KV save; the object seals once every
+//! slot arrived. Two savers of one slice keep two copies, and a load reads the
+//! nearest: its own NUMA node, else its own socket, else the first.
 //!
 //! Sealed objects are [`SealedBlock`]s under the [`BlockKey`]
 //! `(hex(namespace), prefix)`, so they share the pinned pool, LRU eviction,
@@ -229,47 +226,6 @@ impl Shape {
         self.layers as u64 * self.slice_bytes
     }
 
-    /// NUMA nodes saver `saver` (an index into `savers`) spreads its objects
-    /// over: those of the registered ranks (`numas`) that read its copy, as
-    /// [`Self::read_slots`] picks it. A rank reads the copy whose saver shares
-    /// its socket, else the first copy of its slice. The saver's own node
-    /// when none is known.
-    fn spread(
-        &self,
-        saver: usize,
-        numas: &BTreeMap<u32, NumaNode>,
-        socket: impl Fn(NumaNode) -> Option<u32>,
-    ) -> Vec<NumaNode> {
-        let me = self.savers[saver];
-        let slice = self.slice(me);
-        let copies: Vec<u32> = self
-            .savers
-            .iter()
-            .copied()
-            .filter(|&r| self.slice(r) == slice)
-            .collect();
-        let socket_of = |r: u32| numas.get(&r).and_then(|&n| socket(n));
-        let reads_from = |r: u32| {
-            let at = socket_of(r);
-            copies
-                .iter()
-                .copied()
-                .find(|&c| at.is_some() && socket_of(c) == at)
-                .unwrap_or(copies[0])
-        };
-        let mut out: Vec<NumaNode> = numas
-            .iter()
-            .filter(|&(&r, n)| n.is_valid() && self.slice(r) == slice && reads_from(r) == me)
-            .map(|(_, &n)| n)
-            .collect();
-        out.sort();
-        out.dedup();
-        if out.is_empty() {
-            out.push(numas.get(&me).copied().unwrap_or(NumaNode::UNKNOWN));
-        }
-        out
-    }
-
     /// Pinned base and allocation of the slot `rank` reads in each layer of
     /// `block`, from the copy nearest `numa`.
     fn read_slots(
@@ -323,12 +279,6 @@ impl Shape {
             })
             .collect()
     }
-}
-
-/// The node of `spread` an object with `prefix`, a digest, goes to.
-fn spread_pick(spread: &[NumaNode], prefix: &[u8; 32]) -> NumaNode {
-    let h = u64::from_le_bytes(prefix[..8].try_into().expect("8 bytes"));
-    spread[(h % spread.len() as u64) as usize]
 }
 
 /// A run of one span inside one layer's slice.
@@ -663,15 +613,6 @@ impl ObjectStore {
         Ok((device, shapes))
     }
 
-    /// The NUMA node of each registered rank of `instance`.
-    fn rank_numas(&self, instance: &str) -> BTreeMap<u32, NumaNode> {
-        self.instances
-            .lock()
-            .get(instance)
-            .map(|inst| inst.devices.iter().map(|(&r, d)| (r, d.numa)).collect())
-            .unwrap_or_default()
-    }
-
     fn shape(&self, instance: &str, namespace: &[u8; 32]) -> Result<Arc<Shape>, EngineError> {
         self.instances
             .lock()
@@ -930,7 +871,7 @@ impl PegaEngine {
     }
 
     /// Copy `writes` from rank `rank` of `instance_id` into pinned memory on
-    /// the NUMA nodes of the saver's spread and queue them for the insert worker, as a KV
+    /// the device's NUMA node and queue them for the insert worker, as a KV
     /// save does; returns once the copies finish. Writes to objects already
     /// cached copy nothing. An object seals once every saver wrote every
     /// layer; unsealed objects expire with KV inflight blocks.
@@ -972,8 +913,7 @@ impl PegaEngine {
         }
 
         // Like KV saves: SSD-aligned slots when SSD is on, and one allocation
-        // per (namespace, NUMA node, layer) across this save's objects unless
-        // blockwise. Each object goes to one node of its saver's spread.
+        // per (namespace, layer) across this save's objects unless blockwise.
         let pad = self.storage.is_ssd_enabled();
         let stride = |n: u64| {
             if pad {
@@ -982,30 +922,24 @@ impl PegaEngine {
                 n
             }
         };
-        let rank_numas = self.objects.rank_numas(instance_id);
-        let mut spreads: HashMap<[u8; 32], Vec<NumaNode>> = HashMap::new();
-        let mut by_layer: BTreeMap<([u8; 32], NumaNode, usize), Vec<usize>> = BTreeMap::new();
+        let mut by_layer: BTreeMap<([u8; 32], usize), Vec<usize>> = BTreeMap::new();
         for &i in &todo {
-            let key = &writes[i].key;
-            let spread = spreads.entry(key.namespace).or_insert_with(|| {
-                shapes[i].spread(savers[i], &rank_numas, |n: NumaNode| n.socket())
-            });
-            let numa = spread_pick(spread, &key.prefix);
             for l in 0..shapes[i].layers {
                 by_layer
-                    .entry((key.namespace, numa, l))
+                    .entry((writes[i].key.namespace, l))
                     .or_default()
                     .push(i);
             }
         }
+        let numa = Some(device.numa);
         let blockwise = self.storage.blockwise_alloc();
         let mut keep: Vec<Arc<PinnedAllocation>> = Vec::new();
         // Pinned base and allocation of each (write, layer) slot.
         let mut slots: HashMap<(usize, usize), (MappedPinnedPtr, usize)> = HashMap::new();
         type Layers = BTreeMap<usize, RawSaveLayer>;
-        let mut batches: BTreeMap<([u8; 32], NumaNode), (usize, Layers)> = BTreeMap::new();
+        let mut batches: BTreeMap<[u8; 32], (usize, Layers)> = BTreeMap::new();
         let mut padded = 0u64;
-        for ((ns, numa, layer), list) in &by_layer {
+        for ((ns, layer), list) in &by_layer {
             let len = shapes[list[0]].slice_bytes;
             let slot_len = stride(len);
             let groups: Vec<&[usize]> = if blockwise {
@@ -1016,7 +950,7 @@ impl PegaEngine {
             for group in groups {
                 let total = slot_len * group.len() as u64;
                 let alloc = NonZeroU64::new(total)
-                    .and_then(|n| self.storage.allocate(n, Some(*numa)))
+                    .and_then(|n| self.storage.allocate(n, numa))
                     .ok_or_else(|| {
                         EngineError::Storage(format!(
                             "pinned pool exhausted while allocating {total} bytes of object layer {layer}"
@@ -1040,7 +974,7 @@ impl PegaEngine {
                     slots.insert((i, *layer), (base, Arc::as_ptr(&alloc) as usize));
                     let shape = &shapes[i];
                     let saved = batches
-                        .entry((*ns, *numa))
+                        .entry(*ns)
                         .or_insert_with(|| (shape.total_slots(), Layers::new()))
                         .1
                         .entry(*layer)
@@ -1092,17 +1026,17 @@ impl PegaEngine {
             .record(start.elapsed().as_secs_f64(), &[]);
         debug!(
             "save_objects completed: instance_id={instance_id} rank={rank} objects={} \
-             bytes={padded} numa={:?} prep_ms={:.2} total_ms={:.2}",
+             bytes={padded} numa={} prep_ms={:.2} total_ms={:.2}",
             todo.len(),
-            spreads.values().collect::<Vec<_>>(),
+            device.numa,
             prep.as_secs_f64() * 1000.0,
             start.elapsed().as_secs_f64() * 1000.0,
         );
-        for ((ns, numa), (total_slots, layers)) in batches {
+        for (ns, (total_slots, layers)) in batches {
             self.storage.send_raw_insert(RawSaveBatch {
                 namespace: hex(&ns),
                 total_slots,
-                numa_node: numa,
+                numa_node: device.numa,
                 layers: layers.into_values().collect(),
             });
         }
@@ -1280,65 +1214,6 @@ mod tests {
         ] {
             assert!(Shape::new(&m, rank).is_err(), "{case}");
         }
-    }
-
-    #[test]
-    fn savers_spread_over_the_nodes_of_their_readers() {
-        // Rank r on NUMA node r, four nodes per socket.
-        let all: BTreeMap<u32, NumaNode> = (0..8).map(|r| (r, NumaNode(r))).collect();
-        let by_socket = |n: NumaNode| Some(n.0 / 4);
-        let nodes = |v: &[u32]| v.iter().map(|&n| NumaNode(n)).collect::<Vec<_>>();
-        let one = Shape::new(&meta(8, 36864, 576, &[0]), 0).unwrap();
-        let two = Shape::new(&meta(8, 36864, 576, &[0, 4]), 0).unwrap();
-        let gqa = Shape::new(&meta(4, 65536, 256, &[0, 1, 2, 3]), 0).unwrap();
-        // GQA with fewer KV heads than ranks: 2 and 4 slices over TP8.
-        let halves = Shape::new(&meta(8, 32768, 256, &[0, 4]), 0).unwrap();
-        let pairs = Shape::new(&meta(8, 65536, 256, &[0, 2, 4, 6]), 0).unwrap();
-        let only0: BTreeMap<u32, NumaNode> = [(0, NumaNode(0))].into();
-        for (case, shape, saver, numas, socket, expected) in [
-            (
-                "one copy: every rank",
-                &one,
-                0,
-                &all,
-                true,
-                nodes(&[0, 1, 2, 3, 4, 5, 6, 7]),
-            ),
-            ("copy per socket", &two, 0, &all, true, nodes(&[0, 1, 2, 3])),
-            ("second socket", &two, 1, &all, true, nodes(&[4, 5, 6, 7])),
-            (
-                "sockets unknown: first copy",
-                &two,
-                0,
-                &all,
-                false,
-                nodes(&[0, 1, 2, 3, 4, 5, 6, 7]),
-            ),
-            (
-                "sockets unknown: own node",
-                &two,
-                1,
-                &all,
-                false,
-                nodes(&[4]),
-            ),
-            ("a slice per rank", &gqa, 2, &all, true, nodes(&[2])),
-            ("readers not registered", &one, 0, &only0, true, nodes(&[0])),
-            ("gqa halves", &halves, 1, &all, true, nodes(&[4, 5, 6, 7])),
-            ("gqa pairs", &pairs, 1, &all, true, nodes(&[2, 3])),
-        ] {
-            let got = shape.spread(saver, numas, |n| socket.then(|| by_socket(n)).flatten());
-            assert_eq!(got, expected, "{case}");
-        }
-        let spread = nodes(&[0, 1]);
-        let mut prefix = [0u8; 32];
-        let picks: Vec<_> = (0..4u8)
-            .map(|b| {
-                prefix[0] = b;
-                spread_pick(&spread, &prefix)
-            })
-            .collect();
-        assert_eq!(picks, nodes(&[0, 1, 0, 1]));
     }
 
     #[test]
