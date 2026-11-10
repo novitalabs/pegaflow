@@ -251,12 +251,16 @@ def test_hybrid_hit_asks_vllm_to_checkpoint_where_the_full_prefix_ends(ckpt_bloc
     full, ckpt = layout.namespaces
     hashes = _hashes(6)
     stored = {(full.namespace, h) for h in hashes[:5]} | {(ckpt.namespace, hashes[ckpt_block])}
-    s = Scheduler(layout, FakeRpc(stored), "inst")
+    rpc = FakeRpc(stored)
+    s = Scheduler(layout, rpc, "inst")
     req = Req("r", 25, hashes)
     # Full blocks back 20 tokens; resume at the only checkpoint, however far
     # below, and have vLLM commit a checkpoint at 20 for the next request.
     assert s.get_num_new_matched_tokens(req, 0) == (expected, True)
     assert req.shared_prefix_boundary == 20
+    # The checkpoint asks only the points the prefix backs (4..20), never
+    # past them, so the server has nothing to look for elsewhere.
+    assert rpc.queries == [(True, 6), (False, 5)]
 
 
 def test_checkpoint_namespaces_ask_latest_and_meet_below_the_lowest():
@@ -269,9 +273,9 @@ def test_checkpoint_namespaces_ask_latest_and_meet_below_the_lowest():
     rpc = FakeRpc(stored)
     s = Scheduler(layout, rpc, "inst")
     assert s.get_num_new_matched_tokens(Req("r", 25, hashes), 0) == (8, True)
-    # With the prefix, one latest ask each over every point up to the prompt
-    # end; then a asks again below 8.
-    assert rpc.queries == [(True, 6), (False, 6), (False, 6), (False, 2)]
+    # After the prefix (top = 20), one latest ask each over the points up to
+    # 20 only; then a asks again below 8.
+    assert rpc.queries == [(True, 6), (False, 5), (False, 5), (False, 2)]
     assert len(rpc.leases) == 3
 
 
@@ -281,18 +285,17 @@ def test_loading_polls_only_what_is_still_loading():
     hashes = _hashes(6)
     stored = {(full.namespace, h) for h in hashes[:5]} | {(ckpt.namespace, hashes[3])}
     rpc = FakeRpc(stored)
-    rpc.loading, rpc.members_loading = 1, 2
+    rpc.loading, rpc.members_loading = 1, 1
     s = Scheduler(layout, rpc, "inst")
     req = Req("r", 25, hashes)
-    # The checkpoint asks with the prefix, so their fetches overlap: two
-    # waits, not three.
+    # The checkpoint asks in the step the prefix answers: two waits.
     for _ in range(2):
         assert s.get_num_new_matched_tokens(req, 0) == (None, False)
     assert s.get_num_new_matched_tokens(req, 0) == (16, True)
     # The prefix answer is kept while the checkpoint query loads, and each
     # namespace polls under one query id, so the server's fetch can finish.
-    assert [prefix for prefix, _ in rpc.queries] == [True, False, True, False, False]
-    assert rpc.query_ids == ["", "", "q1", "q2", "q2"] and len(rpc.leases) == 2
+    assert [prefix for prefix, _ in rpc.queries] == [True, True, False, False]
+    assert rpc.query_ids == ["", "q1", "", "q3"] and len(rpc.leases) == 2
     # One prefetch, as v1 counts them: the 4 full blocks and 1 checkpoint load.
     stats = s.take_stats()
     assert stats["prefetch_blocks"] == [5] and "pending_prefetches" not in stats

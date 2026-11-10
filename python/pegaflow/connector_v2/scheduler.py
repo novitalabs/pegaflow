@@ -9,11 +9,13 @@ last key held, in memory, on SSD or at a peer; the server fetches only that
 one).
 
 1. Every full namespace gets a prefix query from block ``local / bt``; the
-   shortest answer bounds every hit (``top``). In the same pass every
-   checkpoint namespace asks for its latest state at the resume points up to
-   the prompt end, so their fetches overlap the prefix fetch.
-2. A checkpoint above the lowest of ``top`` and the other checkpoints asks
-   again below it, until they meet. A window namespace asks for the blocks
+   shortest answer bounds every hit (``top``).
+2. Then every checkpoint namespace asks for its latest state at the resume
+   points up to ``top`` only, in the same step when the prefix answers at
+   once. A state above ``top`` could not be used, and asking past what the
+   server holds makes it look on SSD and at peers (Loading). A checkpoint
+   above the lowest of the others asks again below it, until they meet.
+   A window namespace asks for the blocks
    the top point needs as a prefix query; one with a hole asks again at the
    highest lower point whose window ends below the hole, as v1 falls back
    when window hits are not monotone. Blocks below the local hit are on the
@@ -328,21 +330,22 @@ class Scheduler:
                 leases[i] = lease
             present[i] = frozenset(range(start + len(hits)))
             top = min(top, (start + len(hits)) * ns.group.block_tokens)
-        for i in ckpts:
-            with pending:
-                present[i] = self._latest(rec, i, keys[i], local, ahead, leases, 0)
         pending.wait()
         if self._has_checkpoint:
             rec.junction = top
         points = [p for p in ahead if p <= top]
         if not points:
             return None
+        for i in ckpts:
+            with pending:
+                present[i] = self._latest(rec, i, keys[i], local, points, leases, 0)
+        pending.wait()
 
         phase = 1
         while True:
             # Each checkpoint answer is one state; the ones above the lowest
-            # of top and the others ask again below it. The bound only
-            # falls, so this ends.
+            # of the others ask again below it. The bound only falls, so this
+            # ends.
             at = {i: self._ckpt_point(i, present[i], local) for i in ckpts}
             bound = min([top, *at.values()])
             above = [i for i in ckpts if at[i] > bound]
