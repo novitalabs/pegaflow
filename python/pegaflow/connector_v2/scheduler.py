@@ -53,16 +53,9 @@ from typing import Any
 
 from . import semantics as sem
 from .layout import Layout
+from .policy import Policy
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class Policy:
-    """Choices inside what semantics allows; can only narrow a hit."""
-
-    def accept(self, p: int) -> int:
-        return p
 
 
 @dataclass

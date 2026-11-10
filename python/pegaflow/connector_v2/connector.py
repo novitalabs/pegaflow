@@ -28,6 +28,7 @@ from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from pegaflow.connector.connector_metrics import PegaKVConnectorStats, PegaPromMetrics
 
 from .layout import Parallel, Unsupported, build_layout
+from .policy import Policy
 from .scheduler import Scheduler, StepPlan
 from .worker import Region, Worker
 
@@ -94,7 +95,6 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
             from vllm.distributed.parallel_state import get_tp_group
 
             tp_rank = get_tp_group().rank_in_group
-        par = Parallel(pc.tensor_parallel_size, _tp_sockets(pc.tensor_parallel_size))
         mc, cc = vllm_config.model_config, vllm_config.cache_config
         identity = {
             "model": mc.model,
@@ -104,18 +104,26 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
             "quantization": getattr(mc, "quantization", None),
             "hash_algo": getattr(cc, "prefix_caching_hash_algo", None),
         }
-        self._layout = build_layout(kv_cache_config, par, identity)
-
         extra = self._kv_transfer_config.kv_connector_extra_config or {}
+        par = Parallel(pc.tensor_parallel_size)
+        self._layout = build_layout(kv_cache_config, par, identity)
+        is_mla = getattr(mc.hf_text_config, "kv_lora_rank", None) is not None  # v1 detect_mla
+        self._policy = Policy.of(
+            self._layout.groups, is_mla, extra.get("pegaflow.transfer_backend")
+        )
+        if self._policy.copy_per_socket:
+            par = Parallel(pc.tensor_parallel_size, _tp_sockets(pc.tensor_parallel_size))
+            self._layout = build_layout(kv_cache_config, par, identity)
         host = os.environ.get("PEGAFLOW_HOST") or extra.get("pegaflow.host", "http://127.0.0.1")
         port = os.environ.get("PEGAFLOW_PORT") or extra.get("pegaflow.port", 50055)
         self._rpc = EngineRpcClient(f"{host}:{port}")
         self._instance_id = _instance_id(vllm_config)
         logger.info(
-            "[PegaKVConnectorV2] role=%s instance=%s endpoint=%s groups=%s",
+            "[PegaKVConnectorV2] role=%s instance=%s endpoint=%s policy=%s groups=%s",
             role.name,
             self._instance_id,
             self._rpc.endpoint(),
+            self._policy,
             [(ns.gid, ns.group, ns.slices, ns.savers) for ns in self._layout.namespaces],
         )
 
@@ -123,7 +131,7 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
         self._worker: Worker | None = None
         self._pins_bound = False
         if role == KVConnectorRole.SCHEDULER:
-            self._scheduler = Scheduler(self._layout, self._rpc, self._instance_id)
+            self._scheduler = Scheduler(self._layout, self._rpc, self._instance_id, self._policy)
             # The server logs namespaces by their first 8 bytes in hex.
             namespaces = ",".join(ns.namespace[:8].hex() for ns in self._layout.namespaces)
             self._rpc.start_session_watcher(self._instance_id, namespaces)
@@ -139,7 +147,7 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
                 device_id=_server_device_id(),
                 new_load_state=PyLoadState,
                 mark_compute=_mark_compute,
-                transfer_backend=extra.get("pegaflow.transfer_backend", "kernel"),
+                transfer_backend=self._policy.transfer_backend,
             )
 
     @property

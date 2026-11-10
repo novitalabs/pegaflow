@@ -44,13 +44,14 @@ Poll a `Loading` answer with the returned `query_id` and the same keys.
 - Full groups take a prefix query from vLLM's local hit. Checkpoint groups take a latest query over every candidate point in the same pass, so their fetches overlap the prefix fetch; one above the prefix bound or the other checkpoints asks again below the lowest. Window groups take a prefix query over the blocks the largest point needs; one with a hole asks again at the highest lower point whose window ends below the hole.
 - Every load is asynchronous. A failed load is reported as a failed receive, and vLLM recomputes the request, so run with `kv_load_failure_policy=recompute`.
 - Saves follow `semantics.saveable`. Mamba states are saved only from vLLM's `boundary_state_offloads`. A saved block stays pinned in vLLM's block pool until every rank reports the save done.
+- `policy.py` holds the per-model choices, as v1 defaults them. A pure-attention model (full and MLA groups only) saves one copy per slice. A hybrid model (any window or checkpoint group) saves one copy per slice on each CPU socket, so loads read a copy on their own socket. MLA models copy with the kernel and all others with direct copies; `pegaflow.transfer_backend` overrides.
 - vLLM 0.32 keeps a rank's whole KV cache in one allocation, so each rank registers one region. The span of block `b` in layer `l` is `offset_l + b × block_stride_l` with length `page_size_bytes`.
 
 Run the E2E suite with `PEGAFLOW_E2E_CONNECTOR=v2` to use it.
 
 ## Known Issues and Non-goals
 
-- An RDMA fetch moves an object slot by slot, so both MLA copies cross the network. The result is correct, but the traffic is doubled.
+- An RDMA fetch moves an object slot by slot, so both copies of a hybrid MLA model cross the network. The result is correct, but the traffic is doubled.
 - Repeated queries may prefetch remote objects that are never loaded.
 - No pipeline parallelism: `world_size` is the TP size.
 - No cross-config sharing: objects saved under one TP layout cannot be loaded under another. Same-node deployments always share a config. Cross-node re-layout, if ever needed, belongs in the RDMA layer.

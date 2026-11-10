@@ -9,8 +9,8 @@ Spans: vLLM 0.32 puts the whole KV cache of a rank in one allocation, layer
 ``l`` of block ``b`` at ``offset_l + b * block_stride_l``. One object (one
 block of one namespace) is one ``page_bytes`` span per layer.
 
-Savers: per slice, one rank on each CPU socket saves (``NsSpec.savers``), so
-a load reads a copy on its own socket.
+Savers: the ranks in ``NsSpec.savers`` save (one per slice, or one per slice
+on each CPU socket, see ``policy``).
 
 Loads: one ``load_objects`` per step for every request it loads, as v1. Every
 failure is reported as a failed receive; vLLM applies its
@@ -97,7 +97,7 @@ class Worker:
         device_id: int,
         new_load_state: Callable[[], Any],
         mark_compute: Callable[[], Any],
-        transfer_backend: str = "kernel",
+        transfer_backend: str = "direct",
     ):
         self._layout = layout
         self._rpc = rpc

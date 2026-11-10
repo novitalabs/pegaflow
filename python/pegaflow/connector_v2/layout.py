@@ -25,7 +25,8 @@ class Unsupported(RuntimeError):
 @dataclass(frozen=True)
 class Parallel:
     tp_size: int = 1
-    # CPU socket next to each TP rank's GPU; empty: all on one socket.
+    # CPU socket next to each TP rank's GPU, given when the policy keeps a
+    # copy per socket; empty: one copy per slice.
     sockets: tuple[int, ...] = ()
 
 

@@ -12,6 +12,7 @@ import pytest
 
 from pegaflow.connector_v2 import semantics as sem
 from pegaflow.connector_v2.layout import Layout, NsSpec, Parallel, Unsupported, build_layout
+from pegaflow.connector_v2.policy import Policy
 from pegaflow.connector_v2.scheduler import LoadPlan, Scheduler, StepPlan
 from pegaflow.connector_v2.worker import Region, Worker
 
@@ -108,6 +109,25 @@ def test_layout_saves_each_shard_once_per_socket(sockets, savers):
     assert ns.savers == savers
     (one,) = build_layout(cfg, Parallel(4), {}).namespaces
     assert ns.namespace == one.namespace
+
+
+@pytest.mark.parametrize(
+    "groups,is_mla,override,expected",
+    [
+        pytest.param([FULL4], True, None, Policy(False, "kernel"), id="mla-one-copy-kernel"),
+        pytest.param([FULL4], False, None, Policy(False, "direct"), id="gqa-one-copy-direct"),
+        pytest.param([FULL4, CKPT4], False, None, Policy(True, "direct"), id="hybrid-per-socket"),
+        pytest.param([FULL4, CKPT4], True, None, Policy(True, "kernel"), id="hybrid-mla"),
+        pytest.param([FULL4, WIN], False, " Kernel", Policy(True, "kernel"), id="override"),
+    ],
+)
+def test_policy_defaults_follow_v1(groups, is_mla, override, expected):
+    assert Policy.of(groups, is_mla, override) == expected
+
+
+def test_policy_rejects_an_unknown_backend():
+    with pytest.raises(ValueError):
+        Policy.of([FULL4], False, "dma")
 
 
 def test_layout_needs_a_full_group():
@@ -375,7 +395,7 @@ def test_worker_registers_one_region_and_packs_spans():
     regions = {"a": Region(b"h" * 64, 10_000, 100), "b": Region(b"h" * 64, 10_000, 5_000)}
     w.register({"a": "A", "b": "B"}, {"a": 64, "b": 128}, lambda t: regions[t.lower()])
     metas, regs, backend = rpc.registered
-    assert len(regs) == 1 and backend == "kernel" and metas[0]["rank"] == 0
+    assert len(regs) == 1 and backend == "direct" and metas[0]["rank"] == 0
     # Two requests of one step computed the same block: one write.
     w.save(type("P", (), {"saves": [(0, b"k" * 32, 2), (0, b"k" * 32, 2)], "step": 0})())
     w.shutdown()
