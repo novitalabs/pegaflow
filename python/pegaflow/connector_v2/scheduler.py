@@ -112,6 +112,7 @@ class _Req:
     saved_upto: int | None = None
     junction: int = 0  # where the stored full-attention prefix ends
     no_load: bool = False  # a load failed: if vLLM recomputes, never load again
+    loading: frozenset[int] = frozenset()  # GPU blocks of the load in flight
 
 
 class _Loading(Exception):
@@ -455,14 +456,23 @@ class Scheduler:
             self._release(lease for lease in hit.leases.values() if lease not in keep)
             plan.leases = sorted(keep)
             rec.saved_upto = p  # the loaded prefix is in the store already
+            rec.loading = frozenset(gpu for _, _, gpu in plan.blocks)
         self._plan.loads.append(plan)
 
-    def on_loads_failed(self, req_ids: Iterable[str]) -> None:
-        """If vLLM recomputes these requests, they never load again."""
-        for req_id in req_ids:
+    def on_loads_done(
+        self, finished: Iterable[str], failed: Iterable[str], bad_blocks: Container[int] = ()
+    ) -> None:
+        """Requests whose load failed, as a receive or by a GPU block in
+        ``bad_blocks``, never load again if vLLM recomputes them."""
+        failed = set(failed)
+        for rec in self._reqs.values():
+            if rec.loading and any(b in bad_blocks for b in rec.loading):
+                rec.no_load = True
+        for req_id in set(finished) | failed:
             rec = self._reqs.get(req_id)
             if rec is not None:
-                rec.no_load = True
+                rec.loading = frozenset()
+                rec.no_load |= req_id in failed
 
     # ----------------------------------------------------------------- saves
     def bind_pins(self, pin: Callable[[list[int]], Any], unpin: Callable[[Any], None]) -> None:

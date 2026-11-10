@@ -352,6 +352,27 @@ def test_failed_load_recomputes_and_never_loads_again():
     assert s.get_num_new_matched_tokens(req, 0) == (0, False)
 
 
+@pytest.mark.parametrize(
+    "failed, bad_blocks, loads_again",
+    [
+        pytest.param((), {9}, True, id="other-request-block"),
+        pytest.param((), {3}, False, id="own-block"),
+        pytest.param(("r",), (), False, id="failed-receive"),
+    ],
+)
+def test_load_failure_by_block_or_receive_stops_loading(failed, bad_blocks, loads_again):
+    layout = _layout(FULL4)
+    rpc = FakeRpc({(layout.namespaces[0].namespace, h) for h in _hashes(4)})
+    s = Scheduler(layout, rpc, "inst")
+    req = Req("r", 17, _hashes(4))
+    assert s.get_num_new_matched_tokens(req, 0) == (16, True)
+    s.update_state_after_alloc(req, ([1, 2, 3, 4],), 16)
+    assert not s.take_plan().loads[0].fail
+    s.on_loads_done({"r"}, failed, bad_blocks)
+    expected = (16, True) if loads_again else (0, False)
+    assert s.get_num_new_matched_tokens(req, 0) == expected
+
+
 def test_saves_pin_blocks_until_every_worker_saved():
     layout = _layout(FULL4, CKPT4)
     rpc = FakeRpc(set())
@@ -449,4 +470,22 @@ def test_worker_loads_a_step_in_one_rpc_and_fails_it_as_a_whole():
     stats = w.take_stats()
     assert stats["load_blocks"] == [3, 1, 1]
     assert (stats["load_success_count"], stats["load_failure_count"]) == (1, 2)
+    assert w.block_errors() == set()
+    w.shutdown()
+
+
+def test_worker_reports_failed_loads_by_block_with_one_group():
+    layout = Layout((NsSpec(0, FULL4, 1, ("a",), b"N" * 32, 64, 1, (0,)),), 4)
+    w = Worker(layout, _Rpc(), "inst", 0, 1, 0, lambda: _State(-1), _Ready, block_errors=True)
+    w.register({"a": "A"}, {"a": 64}, lambda t: Region(b"h" * 64, 10_000, 0))
+    w.start(
+        StepPlan(
+            loads=[
+                LoadPlan("r1", [b"l1"], [(0, b"x" * 32, 1), (0, b"y" * 32, 2)]),
+                LoadPlan("r2", fail=True),  # nothing written: a failed receive
+            ]
+        )
+    )
+    assert w.poll() == ({"r1", "r2"}, {"r2"})
+    assert w.block_errors() == {1, 2} and w.block_errors() == set()
     w.shutdown()

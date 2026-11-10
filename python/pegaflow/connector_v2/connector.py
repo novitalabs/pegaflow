@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import logging
 import os
-import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -25,6 +24,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 
+from pegaflow.connector.common import resolve_instance_id
 from pegaflow.connector.connector_metrics import PegaKVConnectorStats, PegaPromMetrics
 
 from .layout import Parallel, Unsupported, build_layout
@@ -117,7 +117,8 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
         host = os.environ.get("PEGAFLOW_HOST") or extra.get("pegaflow.host", "http://127.0.0.1")
         port = os.environ.get("PEGAFLOW_PORT") or extra.get("pegaflow.port", 50055)
         self._rpc = EngineRpcClient(f"{host}:{port}")
-        self._instance_id = _instance_id(vllm_config)
+        # As v1: vLLM already suffixes engine_id per DP rank.
+        self._instance_id = resolve_instance_id(vllm_config)
         logger.info(
             "[PegaKVConnectorV2] role=%s instance=%s endpoint=%s policy=%s groups=%s",
             role.name,
@@ -148,6 +149,8 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
                 new_load_state=PyLoadState,
                 mark_compute=_mark_compute,
                 transfer_backend=self._policy.transfer_backend,
+                # vLLM maps failed block ids to requests with one group only.
+                block_errors=len(kv_cache_config.kv_cache_groups) == 1,
             )
 
     @property
@@ -199,8 +202,11 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         assert self._scheduler is not None
-        if connector_output.failed_recving:
-            self._scheduler.on_loads_failed(connector_output.failed_recving)
+        self._scheduler.on_loads_done(
+            connector_output.finished_recving or (),
+            connector_output.failed_recving or (),
+            connector_output.invalid_block_ids or (),
+        )
         meta = connector_output.kv_connector_worker_meta
         if isinstance(meta, PegaWorkerMetadata):
             self._scheduler.on_saved_through(meta.saved_through)
@@ -259,6 +265,10 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
             finished_sending=set(), finished_recving=finished, failed_recving=failed
         )
 
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        assert self._worker is not None
+        return self._worker.block_errors()
+
     def build_connector_worker_meta(self) -> KVConnectorWorkerMetadata | None:
         assert self._worker is not None
         # Every step from every worker: aggregation takes the min.
@@ -285,19 +295,6 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
             self._scheduler.shutdown()
         if self._worker is not None:
             self._worker.shutdown()
-
-
-def _instance_id(vllm_config: VllmConfig) -> str:
-    instance_id = (
-        vllm_config.kv_transfer_config.engine_id
-        or os.environ.get("PEGAFLOW_INSTANCE_ID")
-        or vllm_config.instance_id
-        or uuid.uuid4().hex
-    )
-    pc = vllm_config.parallel_config
-    if pc.data_parallel_size > 1 and pc.data_parallel_rank_local is not None:
-        instance_id = f"{instance_id}_dp{pc.data_parallel_rank_local}"
-    return instance_id
 
 
 def _block_pins(pool: Any) -> tuple[Any, Any]:

@@ -12,11 +12,15 @@ block of one namespace) is one ``page_bytes`` span per layer.
 Savers: the ranks in ``NsSpec.savers`` save (one per slice, or one per slice
 on each CPU socket, see ``policy``).
 
-Loads: one ``load_objects`` per step for every request it loads, as v1. Every
-failure is reported as a failed receive; vLLM applies its
-``kv_load_failure_policy`` (recompute, or fail the request). A load not done
-after ``PEGA_LOAD_TIMEOUT_SECONDS`` (default 120, at least 30, as v1) fails
-the same way, so a server that died after accepting it cannot hang requests.
+Loads: one ``load_objects`` per step for every request it loads, as v1. With
+one vLLM cache group a failure reports the GPU blocks it was writing, as v1
+(``get_block_ids_with_load_errors``): vLLM cuts the hit at the first one and
+keeps the local prefix. vLLM takes block ids only with one cache group, so
+with several the failure is a failed receive and the request starts over.
+Either way vLLM applies its ``kv_load_failure_policy`` (recompute, or fail the
+request). A load not done after ``PEGA_LOAD_TIMEOUT_SECONDS`` (default 120,
+at least 30, as v1) fails the same way, so a server that died after accepting
+it cannot hang requests.
 
 Saves are asynchronous: ``save`` marks the compute stream and queues the job;
 a saver thread waits for the marks, then sends every queued job in one
@@ -98,8 +102,12 @@ class Worker:
         new_load_state: Callable[[], Any],
         mark_compute: Callable[[], Any],
         transfer_backend: str = "direct",
+        block_errors: bool = False,
     ):
         self._layout = layout
+        # Report failed loads by GPU block (one vLLM cache group) instead of
+        # as failed receives.
+        self._block_errors = block_errors
         self._rpc = rpc
         self._instance_id = instance_id
         self._rank = rank
@@ -110,9 +118,11 @@ class Worker:
         self._transfer_backend = transfer_backend
         self._geo: list[_NsGeometry] = []
         self._saver_of = [rank in ns.savers for ns in layout.namespaces]
-        # One load state per step: (state, req ids, start, blocks).
-        self._loads: list[tuple[Any, list[str], float, int]] = []
-        self._failed: set[str] = set()
+        # One load state per step: (state, req ids, start, GPU block ids).
+        self._loads: list[tuple[Any, list[str], float, list[int]]] = []
+        self._failed: set[str] = set()  # failed receives
+        self._done: set[str] = set()  # finished receives, failed by block
+        self._bad_blocks: set[int] = set()
         # Async saves complete in submit order (one saver thread).
         self._cv = threading.Condition()
         self._submitted = 0
@@ -232,10 +242,22 @@ class Worker:
             )
         except Exception as e:
             logger.warning("[PegaKVConnectorV2] load failed reqs=%s: %r", req_ids, e)
-            self._failed.update(req_ids)
+            self._fail(req_ids, [gpu for _, _, gpu in blocks])
             self._record("load", time.perf_counter() - start, len(blocks), False)
             return
-        self._loads.append((state, req_ids, start, len(blocks)))
+        self._loads.append((state, req_ids, start, [gpu for _, _, gpu in blocks]))
+
+    def _fail(self, req_ids: list[str], gpu_blocks: list[int]) -> None:
+        if self._block_errors:
+            self._done.update(req_ids)
+            self._bad_blocks.update(gpu_blocks)
+        else:
+            self._failed.update(req_ids)
+
+    def block_errors(self) -> set[int]:
+        """GPU blocks whose load failed since the last call."""
+        bad, self._bad_blocks = self._bad_blocks, set()
+        return bad
 
     def poll(self) -> tuple[set[str], set[str]]:
         """(finished_recving, failed_recving); failed ones are in both."""
@@ -243,7 +265,8 @@ class Worker:
         pending = []
         now = time.perf_counter()
         for load in self._loads:
-            state, req_ids, start, n_blocks = load
+            state, req_ids, start, gpu_blocks = load
+            n_blocks = len(gpu_blocks)
             if state.is_ready():
                 ok = state.get_state() == 1
                 if not ok:
@@ -263,11 +286,12 @@ class Worker:
                 continue
             finished.update(req_ids)
             if not ok:
-                self._failed.update(req_ids)
+                self._fail(req_ids, gpu_blocks)
             self._record("load", now - start, n_blocks, ok)
         self._loads = pending
         failed, self._failed = self._failed, set()
-        return finished | failed, failed
+        done, self._done = self._done, set()
+        return finished | done | failed, failed
 
     # ----------------------------------------------------------------- saves
     def save(self, plan: StepPlan) -> None:
