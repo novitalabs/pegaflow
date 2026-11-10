@@ -270,25 +270,34 @@ impl PrefetchScheduler {
 
     /// Start fetching, for `id`, the last of `keys` (one namespace, ascending)
     /// that a peer or SSD holds: one MetaServer membership query, then a
-    /// fetch of that key alone. False when nothing can serve them; true as
-    /// well when a fetch of `id` already runs.
+    /// fetch of that key alone. False when nothing can serve them (without a
+    /// peer to ask, SSD is checked here); true as well when a fetch of `id`
+    /// already runs.
     pub(super) fn start_latest(&self, id: &str, keys: Vec<BlockKey>) -> bool {
-        if keys.is_empty() || (self.rdma_fetch.is_none() && self.ssd_store.is_none()) {
+        if keys.is_empty() {
             return false;
-        }
-        let mut state = self.state.lock();
-        if state.members.contains_key(id) {
-            return true;
         }
         // As `start_prefetch_task`: a peer that served less than promised
         // for this id is not asked again.
-        let rdma_fetch = self
-            .rdma_fetch
-            .as_ref()
-            .filter(|_| !state.failed_remote.contains_key(id))
-            .cloned();
-        if rdma_fetch.is_none() && self.ssd_store.is_none() {
-            return false;
+        let rdma_fetch = {
+            let state = self.state.lock();
+            if state.members.contains_key(id) {
+                return true;
+            }
+            self.rdma_fetch
+                .as_ref()
+                .filter(|_| !state.failed_remote.contains_key(id))
+                .cloned()
+        };
+        if rdma_fetch.is_none() {
+            // No MetaServer to wait on: answer at once when SSD holds none.
+            let on_ssd = self
+                .ssd_store
+                .as_ref()
+                .is_some_and(|ssd| ssd.contains_keys(keys.iter()).contains(&true));
+            if !on_ssd {
+                return false;
+            }
         }
         let deps = PrefetchTaskDeps {
             rdma_fetch,
@@ -296,6 +305,10 @@ impl PrefetchScheduler {
             prefetch_state: Arc::clone(&self.state),
             max_prefetch_blocks: self.max_prefetch_blocks,
         };
+        let mut state = self.state.lock();
+        if state.members.contains_key(id) {
+            return true;
+        }
         let task_id = id.to_string();
         let handle = tokio::spawn(async move { run_latest_task(deps, task_id, keys).await });
         state.members.insert(

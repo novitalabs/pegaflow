@@ -16,8 +16,8 @@ one).
    again below it, until they meet. A window namespace asks for the blocks
    the top point needs as a prefix query; one with a hole asks again at the
    highest lower point whose window ends below the hole, as v1 falls back
-   when window hits are not monotone. Blocks below the local hit are on the GPU already and count
-   as present.
+   when window hits are not monotone. Blocks below the local hit are on the
+   GPU already and count as present.
 3. ``semantics.resolve`` picks ``p``; only blocks past the local hit load.
 
 While the server fetches from SSD or peers a query answers Loading and vLLM

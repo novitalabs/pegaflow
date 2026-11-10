@@ -740,8 +740,9 @@ impl PegaEngine {
     /// `wait_for_full_prefix`: the leading keys in memory, or `Loading` while
     /// SSD and peers bring more in. Otherwise (keys ascending) only the last
     /// key held in memory, on SSD or at a peer: `Loading` while one past the
-    /// last in memory may be elsewhere, and only that one is fetched. Poll with the same `query_id` and keys;
-    /// a `None` id gets a fresh one. Returns the id and the answer.
+    /// last in memory may be elsewhere, and only that one is fetched. Poll
+    /// with the same `query_id` and keys; a `None` id gets a fresh one.
+    /// Returns the id and the answer.
     pub async fn query_object(
         &self,
         instance_id: &str,
