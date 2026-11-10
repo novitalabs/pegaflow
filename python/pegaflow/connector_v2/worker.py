@@ -16,11 +16,11 @@ Loads: one ``load_objects`` per step for every request it loads, as v1. With
 one vLLM cache group a failure reports the GPU blocks it was writing, as v1
 (``get_block_ids_with_load_errors``): vLLM cuts the hit at the first one and
 keeps the local prefix. vLLM takes block ids only with one cache group, so
-with several the failure is a failed receive and the request starts over.
-Either way vLLM applies its ``kv_load_failure_policy`` (recompute, or fail the
-request). A load not done after ``PEGA_LOAD_TIMEOUT_SECONDS`` (default 120,
-at least 30, as v1) fails the same way, so a server that died after accepting
-it cannot hang requests.
+with several the failure is a failed receive. Either way vLLM applies its
+``kv_load_failure_policy``: ``fail`` (the default, as v1) fails the request,
+``recompute`` recomputes it. A load not done after
+``PEGA_LOAD_TIMEOUT_SECONDS`` (default 120, at least 30, as v1) fails the
+same way, so a server that died after accepting it cannot hang requests.
 
 Saves are asynchronous: ``save`` marks the compute stream and queues the job;
 a saver thread waits for the marks, then sends every queued job in one

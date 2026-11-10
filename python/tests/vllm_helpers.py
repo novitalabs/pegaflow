@@ -305,7 +305,6 @@ class VLLMServer:
             if self.use_pegaflow and os.environ.get("PEGAFLOW_E2E_CONNECTOR") == "v2":
                 kv_config["kv_connector"] = "PegaKVConnectorV2"
                 kv_config["kv_connector_module_path"] = "pegaflow.connector_v2"
-                kv_config["kv_load_failure_policy"] = "recompute"
             # The server no longer selects a transfer backend; the connector
             # does. Force it here so --pegaflow-transfer-backend still exercises
             # the chosen path end-to-end, regardless of the model's MLA default.
