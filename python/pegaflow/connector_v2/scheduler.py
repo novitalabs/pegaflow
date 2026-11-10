@@ -29,8 +29,8 @@ the server answers.
 
 Loads are always asynchronous. A plan that cannot load (vLLM trimmed the hit
 off a resume point or handed a null block) is a failed receive like a failed
-transfer; vLLM applies its ``kv_load_failure_policy``. The request never loads
-again if it is recomputed.
+transfer; vLLM applies its ``kv_load_failure_policy`` (``fail`` by default, as
+v1). Under ``recompute`` the request never loads again.
 
 Saves: every block a step completes is pinned in vLLM's block pool from the
 step that plans it until every worker reports that step saved
@@ -52,7 +52,6 @@ from typing import Any
 
 from . import semantics as sem
 from .layout import Layout
-from .policy import Policy
 
 logger = logging.getLogger(__name__)
 
@@ -140,17 +139,10 @@ class _Pass:
 
 
 class Scheduler:
-    def __init__(
-        self,
-        layout: Layout,
-        rpc: Any,
-        instance_id: str,
-        policy: Policy | None = None,
-    ):
+    def __init__(self, layout: Layout, rpc: Any, instance_id: str):
         self._layout = layout
         self._rpc = rpc
         self._instance_id = instance_id
-        self._policy = policy or Policy()
         self._reqs: dict[str, _Req] = {}
         self._plan = StepPlan()
         self._steps = 0
@@ -380,7 +372,6 @@ class Scheduler:
             phase += 1
 
         p = sem.resolve(groups, present, n_tokens)
-        p = max(0, min(int(self._policy.accept(p)), p))
         hit = _Hit(p, local, present, keys, leases, n_tokens)
         if p <= local or not sem.resumable_at(groups, p) or not self._wanted(hit, p):
             return None

@@ -6,7 +6,6 @@
 - Transfer backend: as v1 ``resolve_transfer_backend``, the kernel for MLA
   models (many small slots, one launch beats one copy per slot) and direct
   copies for everything else; ``pegaflow.transfer_backend`` overrides.
-- ``accept`` can only narrow a hit.
 
 Pure Python, so the default unit gate tests it without vLLM.
 """
@@ -39,6 +38,3 @@ class Policy:
                 )
         hybrid = any(g.kind != sem.FULL for g in groups)
         return cls(copy_per_socket=hybrid, transfer_backend=backend)
-
-    def accept(self, p: int) -> int:
-        return p

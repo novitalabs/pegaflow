@@ -1,7 +1,7 @@
 """What resuming a request at token ``p`` needs from each KV cache group.
 
 Pure functions over block indices, no vLLM, torch or server types. A group
-of ``block_tokens``-token blocks has one of four kinds:
+of ``block_tokens``-token blocks has one of three kinds:
 
 - ``full``: every past token is attended; resuming at ``p`` needs blocks
   ``[0, ceil(p / bt))``.
@@ -10,7 +10,6 @@ of ``block_tokens``-token blocks has one of four kinds:
   the exact value is ``W - 1`` (plus ``extra_retained_tokens``).
 - ``checkpoint``: block ``k - 1`` holds the state after ``k * bt`` tokens
   (Mamba ``align``); it needs ``[p / bt - 1, p / bt)``.
-- ``scratch``: nothing survives; it needs nothing and saves nothing.
 
 Attention resumes at any ``p``: a partly used last block loads whole and vLLM
 recomputes the tokens from ``p`` on over it, as v1 does when it recomputes the
@@ -30,8 +29,7 @@ from dataclasses import dataclass
 FULL = "full"
 WINDOW = "window"
 CHECKPOINT = "checkpoint"
-SCRATCH = "scratch"
-KINDS = (FULL, WINDOW, CHECKPOINT, SCRATCH)
+KINDS = (FULL, WINDOW, CHECKPOINT)
 
 
 @dataclass(frozen=True)
@@ -56,16 +54,13 @@ def needed(g: Group, p: int) -> range:
         return range(0, -(-p // bt))
     if g.kind == WINDOW:
         return range(max(p - g.window_tokens, 0) // bt, -(-p // bt))
-    if g.kind == CHECKPOINT:
-        n = p // bt
-        return range(max(n - 1, 0), n)
-    return range(0)
+    n = p // bt  # checkpoint
+    return range(max(n - 1, 0), n)
 
 
 def step_of(groups: Sequence[Group]) -> int:
-    """Resume granularity: lcm of the non-scratch block sizes (0 if none)."""
-    sizes = [g.block_tokens for g in groups if g.kind != SCRATCH]
-    return math.lcm(*sizes) if sizes else 0
+    """Resume granularity: lcm of the block sizes (0 if none)."""
+    return math.lcm(*(g.block_tokens for g in groups)) if groups else 0
 
 
 def resumable_at(groups: Sequence[Group], p: int) -> bool:

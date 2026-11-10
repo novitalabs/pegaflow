@@ -70,7 +70,6 @@ class NsSpec:
 @dataclass(frozen=True)
 class Layout:
     namespaces: tuple[NsSpec, ...]  # full groups first
-    step: int  # resume granularity (semantics.step_of)
 
     @property
     def groups(self) -> list[sem.Group]:
@@ -181,4 +180,4 @@ def build_layout(kv_cache_config: Any, par: Parallel, identity: dict[str, Any]) 
     out.sort(key=lambda ns: ns.group.kind != sem.FULL)
     if not out or out[0].group.kind != sem.FULL:
         raise Unsupported("connector v2 needs a full-attention group to anchor prefix queries")
-    return Layout(tuple(out), sem.step_of([ns.group for ns in out]))
+    return Layout(tuple(out))

@@ -132,7 +132,7 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
         self._worker: Worker | None = None
         self._pins_bound = False
         if role == KVConnectorRole.SCHEDULER:
-            self._scheduler = Scheduler(self._layout, self._rpc, self._instance_id, self._policy)
+            self._scheduler = Scheduler(self._layout, self._rpc, self._instance_id)
             # The server logs namespaces by their first 8 bytes in hex.
             namespaces = ",".join(ns.namespace[:8].hex() for ns in self._layout.namespaces)
             self._rpc.start_session_watcher(self._instance_id, namespaces)

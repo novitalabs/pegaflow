@@ -93,7 +93,6 @@ def test_layout_orders_full_first_and_splits_heads():
     meta = full.meta(world_size=4, rank=3, device_id=7)
     assert meta["bytes_per_block"] == 2048 and meta["local_hidden"] * meta["block_size"] == 1024
     assert len(full.namespace) == 32 and full.namespace != win.namespace
-    assert layout.step == 4
 
 
 @pytest.mark.parametrize(
@@ -202,7 +201,7 @@ def _hashes(n: int) -> list[bytes]:
 
 def _layout(*groups: sem.Group) -> Layout:
     nss = tuple(_ns(i, g, bytes([65 + i])) for i, g in enumerate(groups))
-    return Layout(nss, sem.step_of(groups))
+    return Layout(nss)
 
 
 def test_hit_loads_only_past_local_and_releases_unused_leases():
@@ -339,7 +338,7 @@ def test_block_aligned_prompt_loads_its_last_block():
     assert not lp.fail and [gpu for _, _, gpu in lp.blocks] == [5, 6]
 
 
-def test_failed_load_recomputes_and_never_loads_again():
+def test_unloadable_plan_fails_and_never_loads_again():
     layout = _layout(FULL4)
     rpc = FakeRpc({(layout.namespaces[0].namespace, h) for h in _hashes(4)})
     s = Scheduler(layout, rpc, "inst")
@@ -412,7 +411,7 @@ class _Ready:
 
 
 def test_worker_registers_one_region_and_packs_spans():
-    layout = Layout((NsSpec(0, FULL4, 1, ("a", "b"), b"N" * 32, 64, 1, (0,)),), 4)
+    layout = Layout((NsSpec(0, FULL4, 1, ("a", "b"), b"N" * 32, 64, 1, (0,)),))
     rpc = _Rpc()
     w = Worker(layout, rpc, "inst", 0, 1, 3, object, _Ready)
     regions = {"a": Region(b"h" * 64, 10_000, 100), "b": Region(b"h" * 64, 10_000, 5_000)}
@@ -444,7 +443,7 @@ class _State:
 
 
 def test_worker_loads_a_step_in_one_rpc_and_fails_it_as_a_whole():
-    layout = Layout((NsSpec(0, FULL4, 1, ("a",), b"N" * 32, 64, 1, (0,)),), 4)
+    layout = Layout((NsSpec(0, FULL4, 1, ("a",), b"N" * 32, 64, 1, (0,)),))
     rpc = _Rpc()
     states = [_State(1), _State(-1)]
     w = Worker(layout, rpc, "inst", 0, 1, 0, lambda: states.pop(0), _Ready)
@@ -475,7 +474,7 @@ def test_worker_loads_a_step_in_one_rpc_and_fails_it_as_a_whole():
 
 
 def test_worker_reports_failed_loads_by_block_with_one_group():
-    layout = Layout((NsSpec(0, FULL4, 1, ("a",), b"N" * 32, 64, 1, (0,)),), 4)
+    layout = Layout((NsSpec(0, FULL4, 1, ("a",), b"N" * 32, 64, 1, (0,)),))
     w = Worker(layout, _Rpc(), "inst", 0, 1, 0, lambda: _State(-1), _Ready, block_errors=True)
     w.register({"a": "A"}, {"a": 64}, lambda t: Region(b"h" * 64, 10_000, 0))
     w.start(
