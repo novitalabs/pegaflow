@@ -1291,6 +1291,9 @@ mod tests {
         let one = Shape::new(&meta(8, 36864, 576, &[0]), 0).unwrap();
         let two = Shape::new(&meta(8, 36864, 576, &[0, 4]), 0).unwrap();
         let gqa = Shape::new(&meta(4, 65536, 256, &[0, 1, 2, 3]), 0).unwrap();
+        // GQA with fewer KV heads than ranks: 2 and 4 slices over TP8.
+        let halves = Shape::new(&meta(8, 32768, 256, &[0, 4]), 0).unwrap();
+        let pairs = Shape::new(&meta(8, 65536, 256, &[0, 2, 4, 6]), 0).unwrap();
         let only0: BTreeMap<u32, NumaNode> = [(0, NumaNode(0))].into();
         for (case, shape, saver, numas, socket, expected) in [
             (
@@ -1321,6 +1324,8 @@ mod tests {
             ),
             ("a slice per rank", &gqa, 2, &all, true, nodes(&[2])),
             ("readers not registered", &one, 0, &only0, true, nodes(&[0])),
+            ("gqa halves", &halves, 1, &all, true, nodes(&[4, 5, 6, 7])),
+            ("gqa pairs", &pairs, 1, &all, true, nodes(&[2, 3])),
         ] {
             let got = shape.spread(saver, numas, |n| socket.then(|| by_socket(n)).flatten());
             assert_eq!(got, expected, "{case}");
