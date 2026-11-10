@@ -251,9 +251,15 @@ class Scheduler:
         groups = layout.groups
         n_tokens = request.num_tokens
         rec.junction = 0
-        # vLLM computes at least the last prompt token: blocks past it are never needed.
+        # vLLM computes at least the last prompt token: blocks past it are never
+        # needed. Without a checkpoint the block holding it loads too (as v1)
+        # and vLLM recomputes the token over it.
         cap = max(n_tokens - 1, 0)
-        keys = [ns.keys(request.block_hashes)[: cap // ns.group.block_tokens] for ns in nss]
+        keys = []
+        for ns in nss:
+            bt = ns.group.block_tokens
+            n = cap // bt if self._has_checkpoint else -(-cap // bt)
+            keys.append(ns.keys(request.block_hashes)[:n])
         if sem.resolve(groups, [frozenset(range(len(k))) for k in keys], n_tokens) <= local:
             return None  # even a store holding everything cannot beat vLLM
 
@@ -293,7 +299,7 @@ class Scheduler:
         p = sem.resolve(groups, present, n_tokens)
         p = max(0, min(int(self._policy.accept(p)), p))
         hit = _Hit(p, local, present, keys, leases, n_tokens)
-        if p <= local or p % layout.step or not self._wanted(hit, p):
+        if p <= local or not sem.resumable_at(groups, p) or not self._wanted(hit, p):
             return None
         return hit
 
@@ -342,7 +348,7 @@ class Scheduler:
             return
         plan = LoadPlan(request.request_id)
         p = hit.local + num_external  # vLLM may trim the hit
-        wanted = self._wanted(hit, p) if p % self._layout.step == 0 else None
+        wanted = self._wanted(hit, p) if sem.resumable_at(self._layout.groups, p) else None
         if wanted is not None:
             for i, blocks in wanted.items():
                 gpu = block_ids[self._layout.namespaces[i].gid]

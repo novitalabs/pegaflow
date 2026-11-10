@@ -14,7 +14,9 @@ a load reads a copy on its own socket.
 
 Loads: one ``load_objects`` per step for every request it loads, as v1. Every
 failure is reported as a failed receive; vLLM applies its
-``kv_load_failure_policy`` (recompute, or fail the request).
+``kv_load_failure_policy`` (recompute, or fail the request). A load not done
+after ``PEGA_LOAD_TIMEOUT_SECONDS`` (default 120, at least 30, as v1) fails
+the same way, so a server that died after accepting it cannot hang requests.
 
 Saves are asynchronous: ``save`` marks the compute stream and queues the job;
 a saver thread waits for the marks, then sends every queued job in one
@@ -30,6 +32,7 @@ from __future__ import annotations
 
 import collections
 import logging
+import os
 import queue
 import threading
 import time
@@ -43,6 +46,14 @@ from .layout import Layout, Unsupported
 from .scheduler import StepPlan
 
 logger = logging.getLogger(__name__)
+
+
+def _load_timeout_s() -> float:
+    try:
+        value = int(os.environ.get("PEGA_LOAD_TIMEOUT_SECONDS", "120"))
+    except ValueError:
+        value = 120
+    return float(max(value, 30))
 
 
 @dataclass(frozen=True)
@@ -74,6 +85,7 @@ class Worker:
     # (pins held) before counting the job done.
     SAVE_QUIESCE_S = 10.0
     SHUTDOWN_FLUSH_S = 30.0
+    LOAD_TIMEOUT_S = _load_timeout_s()
 
     def __init__(
         self,
@@ -229,19 +241,30 @@ class Worker:
         """(finished_recving, failed_recving); failed ones are in both."""
         finished: set[str] = set()
         pending = []
+        now = time.perf_counter()
         for load in self._loads:
             state, req_ids, start, n_blocks = load
-            if not state.is_ready():
+            if state.is_ready():
+                ok = state.get_state() == 1
+                if not ok:
+                    logger.warning(
+                        "[PegaKVConnectorV2] load state=%s reqs=%s", state.get_state(), req_ids
+                    )
+            elif now - start > self.LOAD_TIMEOUT_S:
+                ok = False
+                logger.error(
+                    "[PegaKVConnectorV2] load timed out after %.0f s reqs=%s blocks=%d",
+                    now - start,
+                    req_ids,
+                    n_blocks,
+                )
+            else:
                 pending.append(load)
                 continue
             finished.update(req_ids)
-            ok = state.get_state() == 1
             if not ok:
-                logger.warning(
-                    "[PegaKVConnectorV2] load state=%s reqs=%s", state.get_state(), req_ids
-                )
                 self._failed.update(req_ids)
-            self._record("load", time.perf_counter() - start, n_blocks, ok)
+            self._record("load", now - start, n_blocks, ok)
         self._loads = pending
         failed, self._failed = self._failed, set()
         return finished | failed, failed

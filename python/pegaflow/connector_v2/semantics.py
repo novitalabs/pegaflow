@@ -4,13 +4,18 @@ Pure functions over block indices, no vLLM, torch or server types. A group
 of ``block_tokens``-token blocks has one of four kinds:
 
 - ``full``: every past token is attended; resuming at ``p`` needs blocks
-  ``[0, p / bt)``.
+  ``[0, ceil(p / bt))``.
 - ``window``: only the last ``window_tokens`` tokens are attended; it needs
-  ``[(p - window_tokens) / bt, p / bt)``. For vLLM ``sliding_window = W`` the
-  exact value is ``W - 1`` (plus ``extra_retained_tokens``).
+  ``[(p - window_tokens) / bt, ceil(p / bt))``. For vLLM ``sliding_window = W``
+  the exact value is ``W - 1`` (plus ``extra_retained_tokens``).
 - ``checkpoint``: block ``k - 1`` holds the state after ``k * bt`` tokens
   (Mamba ``align``); it needs ``[p / bt - 1, p / bt)``.
 - ``scratch``: nothing survives; it needs nothing and saves nothing.
+
+Attention resumes at any ``p``: a partly used last block loads whole and vLLM
+recomputes the tokens from ``p`` on over it, as v1 does when it recomputes the
+last prompt token. A checkpoint only exists at a block boundary, so a layout
+with one resumes at multiples of ``step_of``.
 
 ``resolve`` picks the largest ``p`` that every group can back, ``saveable``
 lists the blocks a step completes.
@@ -47,12 +52,12 @@ class Group:
 def needed(g: Group, p: int) -> range:
     """Blocks of ``g`` a request resuming at ``p`` must hold."""
     bt = g.block_tokens
-    n = p // bt
     if g.kind == FULL:
-        return range(0, n)
+        return range(0, -(-p // bt))
     if g.kind == WINDOW:
-        return range(max(p - g.window_tokens, 0) // bt, n)
+        return range(max(p - g.window_tokens, 0) // bt, -(-p // bt))
     if g.kind == CHECKPOINT:
+        n = p // bt
         return range(max(n - 1, 0), n)
     return range(0)
 
@@ -63,16 +68,28 @@ def step_of(groups: Sequence[Group]) -> int:
     return math.lcm(*sizes) if sizes else 0
 
 
-def candidates(groups: Sequence[Group], top: int, prompt_len: int) -> range:
-    """Legal resume points ``<= top``, largest first.
+def resumable_at(groups: Sequence[Group], p: int) -> bool:
+    """Whether a request can resume at ``p`` (``p > 0``)."""
+    if any(g.kind == CHECKPOINT for g in groups):
+        return p % step_of(groups) == 0
+    return True
+
+
+def candidates(groups: Sequence[Group], top: int, prompt_len: int) -> list[int]:
+    """Resume points ``<= top`` worth trying, largest first.
 
     vLLM must compute at least the last prompt token, so ``p <= prompt_len - 1``.
+    Between two multiples of ``step_of`` an attention-only layout needs the
+    blocks of the upper one, so only the cap itself is added.
     """
     step = step_of(groups)
     cap = min(top, prompt_len - 1)
-    if step == 0 or cap < step:
-        return range(0)
-    return range(cap // step * step, 0, -step)
+    if step == 0 or cap <= 0:
+        return []
+    points = list(range(cap // step * step, 0, -step))
+    if cap % step and resumable_at(groups, cap):
+        points.insert(0, cap)
+    return points
 
 
 def resolve(

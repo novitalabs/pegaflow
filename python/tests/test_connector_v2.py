@@ -24,7 +24,10 @@ WIN = sem.Group(sem.WINDOW, 4, 7)  # vLLM sliding_window = 8
     "groups,present,prompt_len,expected",
     [
         pytest.param([FULL4], [{0, 1, 2}], 100, 12, id="full-prefix"),
-        pytest.param([FULL4], [{0, 1, 2}], 12, 8, id="last-token-clamp"),
+        # As v1: the last block loads whole, vLLM recomputes the last token.
+        pytest.param([FULL4], [{0, 1, 2}], 12, 11, id="last-token-recomputed"),
+        pytest.param([FULL4, WIN], [{0, 1, 2}, {1, 2}], 12, 11, id="window-last-token"),
+        pytest.param([FULL4, CKPT4], [{0, 1, 2}, {1, 2}], 12, 8, id="checkpoint-stays-aligned"),
         pytest.param([FULL4, CKPT4], [{0, 1, 2, 3}, {1, 2}], 21, 12, id="checkpoint-at-12"),
         pytest.param([FULL4, CKPT4], [{0, 1, 2, 3}, {0, 3}], 21, 16, id="checkpoint-at-16"),
         # Window needs blocks [(16-7)//4, 4) = [2, 4) at p=16: block 1 is a hole.
@@ -267,6 +270,17 @@ def test_drifted_loading_query_is_answered_then_dropped():
     assert rpc.queries == [(True, 4), (True, 4), (True, 3)] and len(rpc.leases) == 1
 
 
+def test_block_aligned_prompt_loads_its_last_block():
+    layout = _layout(FULL4)
+    rpc = FakeRpc({(layout.namespaces[0].namespace, h) for h in _hashes(2)})
+    s = Scheduler(layout, rpc, "inst")
+    req = Req("r", 8, _hashes(2))
+    assert s.get_num_new_matched_tokens(req, 0) == (7, True)
+    s.update_state_after_alloc(req, ([5, 6],), 7)
+    (lp,) = s.take_plan().loads
+    assert not lp.fail and [gpu for _, _, gpu in lp.blocks] == [5, 6]
+
+
 def test_failed_load_recomputes_and_never_loads_again():
     layout = _layout(FULL4)
     rpc = FakeRpc({(layout.namespaces[0].namespace, h) for h in _hashes(4)})
@@ -336,14 +350,15 @@ def test_worker_registers_one_region_and_packs_spans():
 
 
 class _State:
-    def __init__(self, state: int):
+    def __init__(self, state: int, ready: bool = True):
         self.state = state
+        self.ready = ready
 
     def shm_name(self):
         return "shm"
 
     def is_ready(self):
-        return True
+        return self.ready
 
     def get_state(self):
         return self.state
@@ -367,7 +382,13 @@ def test_worker_loads_a_step_in_one_rpc_and_fails_it_as_a_whole():
     assert w.poll() == ({"r1", "r2", "r3"}, {"r3"})
     w.start(StepPlan(loads=[LoadPlan("r4", [b"l4"], [(0, b"w" * 32, 4)])]))
     assert w.poll() == ({"r4"}, {"r4"})
+    # A load that never completes fails once it times out.
+    states.append(_State(0, ready=False))
+    w.start(StepPlan(loads=[LoadPlan("r5", [b"l5"], [(0, b"v" * 32, 5)])]))
+    assert w.poll() == (set(), set())
+    w.LOAD_TIMEOUT_S = -1.0
+    assert w.poll() == ({"r5"}, {"r5"})
     stats = w.take_stats()
-    assert stats["load_blocks"] == [3, 1]
-    assert (stats["load_success_count"], stats["load_failure_count"]) == (1, 1)
+    assert stats["load_blocks"] == [3, 1, 1]
+    assert (stats["load_success_count"], stats["load_failure_count"]) == (1, 2)
     w.shutdown()
