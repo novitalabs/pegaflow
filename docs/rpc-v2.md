@@ -4,8 +4,6 @@ RPC V2 stores KV cache as objects. Each object has a key `(namespace, prefix)`, 
 
 V2 sits next to the v1 KV block RPCs in the same `Engine` service. A deployment uses one path or the other. V2 objects go through the same insert worker, pinned pool, LRU, SSD cache, RDMA fetch and MetaServer as v1 blocks.
 
-The full spec, with field-by-field rationale, is the trellis task `11-08-rpc-v2-refactor`.
-
 ## RPCs
 
 | RPC | Caller | What it does |
