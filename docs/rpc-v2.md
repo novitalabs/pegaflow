@@ -12,15 +12,15 @@ V2 sits next to the v1 KV block RPCs in the same `Engine` service. A deployment 
 | `SaveObjects` | Saver ranks | Copies each object's spans of every layer into pinned memory; returns after the copy |
 | `QueryObject` | Scheduler | Prefix or membership lookup of keys of one namespace; returns `Loading` while fetching, then `Ready` with a lease |
 | `LoadObjects` | Every rank | Copies leased objects into the rank's HBM; completion lands in a `LoadState` |
-| `Release`, `Session` | Scheduler | Same as v1. `SessionRequest` carries only `instance_id` |
+| `Release`, `Session` | Scheduler | Same as v1. The server only logs `SessionRequest.namespace` |
 
 Business errors come back in `ResponseStatus status` (`ok = false`). The gRPC status is only for transport errors.
 
 ## Layout
 
-One rank's slice of one layer is `L = local_hidden × block_size` bytes. A layer has `S = bytes_per_block / L` slices, and rank `r` holds slice `r × S / world_size`. GQA over TP4 with 4 KV heads gives `S = 4`, one slice per rank. MLA gives `S = 1`, so every rank holds the same slice.
+One rank's slice of one layer is `L = local_hidden × block_size` bytes. A layer has `S = bytes_per_block / L` slices, and rank `r` holds slice `r × S / world_size`. GQA over TP4 with 4 KV heads gives `S = 4`, one slice per rank. MLA without DCP gives `S = 1`, so every rank holds the same slice.
 
-An object has one slot per (saver rank, layer). It seals, becoming visible to queries, SSD and the MetaServer, once every saver has written every layer. When two savers map to the same slice (MLA with `saver_rank = [0, 4]`), the server keeps both copies, each on its writer's NUMA node. A load reads the copy on the loading rank's NUMA node when there is one.
+An object has one slot per (saver rank, layer). It seals, becoming visible to queries, SSD and the MetaServer, once every saver has written every layer. When two savers map to the same slice (MLA of a hybrid model over two sockets, `saver_rank = [0, 4]`), the server keeps both copies, each on its writer's NUMA node. A load reads the copy on the loading rank's NUMA node, else one on its socket, else the first.
 
 Spans of one object list every layer of its namespace, in `layer_names` order, and must add up to `len(layer_names) × L`. Each span element is 16 bytes, `offset` then `len` as little-endian u64, with offsets counted from the start of the region's allocation.
 
@@ -44,7 +44,7 @@ Poll a `Loading` answer with the returned `query_id` and the same keys.
 - Saves follow `semantics.saveable`. Mamba states are saved only from vLLM's `boundary_state_offloads`. A saved block stays pinned in vLLM's block pool until every rank reports the save done.
 - `policy.py` holds the per-model choices, as v1 defaults them. A pure-attention model (full and MLA groups only) saves one copy per slice. A hybrid model (any window or checkpoint group) saves one copy per slice on each CPU socket, so loads read a copy on their own socket. MLA models copy with the kernel and all others with direct copies; `pegaflow.transfer_backend` overrides.
 - vLLM 0.32 keeps a rank's whole KV cache in one allocation, so each rank registers one region. The span of block `b` in layer `l` is `offset_l + b × block_stride_l` with length `page_size_bytes`.
-- PCP and DCP are handled on the client side; the server only sees slices. `world_size` is `tp × pcp`. PCP ranks hold the same bytes. Under DCP one vLLM block covers `block_size × dcp` tokens and each DCP rank holds its own share of them, so a DCP-sharded group has `dcp` times as many slices. The connector numbers server ranks so the ranks holding one slice are consecutive, as `slice = rank × S / world_size` needs: vLLM's DCP groups span PCP first, so with `dcp = tp × pcp` the server rank order differs from vLLM's world rank order.
+- PCP and DCP are handled on the client side; the server only sees slices. `world_size` is `tp × pcp`. PCP ranks hold the same bytes. Under DCP one vLLM block covers `block_size × dcp` tokens and each DCP rank holds its own share of them, so a DCP-sharded group has `dcp` times as many slices. Mamba states are not DCP-sharded. The connector numbers server ranks so the ranks holding one slice are consecutive, as `slice = rank × S / world_size` needs. vLLM puts TP innermost, so under PCP the holders of one slice are not always consecutive in world rank order: GQA with 2 KV heads over TP2 × PCP2 holds heads `(0, 1, 0, 1)` and registers server ranks `(0, 2, 1, 3)`.
 
 Run the E2E suite with `PEGAFLOW_E2E_CONNECTOR=v2` to use it.
 
@@ -54,6 +54,5 @@ Run the E2E suite with `PEGAFLOW_E2E_CONNECTOR=v2` to use it.
 - Repeated queries may prefetch remote objects that are never loaded.
 - Objects go to the saver's NUMA node only. With one copy of a replicated slice (MLA), the pinned pools of the other ranks' nodes stay unused. This matters on hosts with several NUMA nodes per socket; v1 stripes MLA saves over every rank instead.
 - No pipeline parallelism.
-- No cross-config sharing: objects saved under one TP/PCP/DCP layout cannot be loaded under another. Same-node deployments always share a config. Cross-node re-layout, if ever needed, belongs in the RDMA layer.
-- The namespace digest leaves out the parallel layout: TP/PCP/DCP sizes, slices, saver ranks, socket placement and the DCP interleave size (`cp_kv_cache_interleave_size`). Until cross-config loads exist, instances sharing a namespace must use the same layout, replica counts for each slice and interleave size. Deployments guarantee this; E2E runs must verify and record it before testing cache sharing.
+- No cross-config loads yet. The namespace digest leaves out the parallel layout (TP/PCP/DCP sizes, slices, saver ranks, socket placement, DCP interleave size `cp_kv_cache_interleave_size`), so instances of one model share namespaces across layouts. Until cross-config loads exist, deployments keep instances that share a namespace on the same layout, replica counts for each slice and interleave size; E2E runs must verify and record it before testing cache sharing. A load across layouts usually fails the slot-count check; it reads wrong bytes when the slot counts match, as when only the interleave size differs. Same-node deployments always share a config; cross-node re-layout belongs in the RDMA layer.
 - `interleave_token` in `NamespaceMeta` is stored but not read; the connector sends 0.
