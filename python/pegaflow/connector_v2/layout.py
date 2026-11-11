@@ -9,6 +9,7 @@ unit gate builds layouts from stubs without importing vLLM.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 from collections.abc import Sequence
@@ -158,6 +159,36 @@ def _savers(
     return tuple(sorted(out.values()))
 
 
+# Spec fields that follow the parallel layout (heads, state and page sizes
+# per TP rank; tokens per DCP rank). The digest leaves them out so every
+# TP/PCP/DCP layout of one model gets the same namespaces; the group's token
+# span goes in through ``kind``. Model identity already fixes their values.
+_PER_RANK = frozenset(
+    {
+        "block_size",
+        "num_kv_heads",
+        "num_head_slots",
+        "num_heads",
+        "page_size_bytes",
+        "page_size_padded",
+        "shapes",
+    }
+)
+
+
+def _spec_doc(spec: Any) -> Any:
+    """``spec`` as JSON-able data without its per-rank fields."""
+    per_layer = getattr(spec, "kv_cache_specs", None)  # UniformTypeKVCacheSpecs
+    if isinstance(per_layer, dict):
+        return {name: _spec_doc(s) for name, s in sorted(per_layer.items())}
+    fields = (
+        {f.name: getattr(spec, f.name) for f in dataclasses.fields(spec)}
+        if dataclasses.is_dataclass(spec)
+        else dict(vars(spec))
+    )
+    return [type(spec).__name__, {k: v for k, v in fields.items() if k not in _PER_RANK}]
+
+
 def _digest(h: bytes) -> bytes:
     return h if len(h) == 32 else hashlib.sha256(h).digest()
 
@@ -222,12 +253,12 @@ def build_layout(kv_cache_config: Any, par: Parallel, identity: dict[str, Any]) 
     out: list[NsSpec] = []
     for gid, kv_group, layers, group, page, content, hash_scale in found:
         n_slices = len(set(content))
+        # Content only: nothing here depends on TP, PCP or DCP.
         doc = {
             **identity,
             "gid": gid,
-            "spec": repr(kv_group.kv_cache_spec),
+            "spec": _spec_doc(kv_group.kv_cache_spec),
             "kind": [group.kind, group.block_tokens, group.window_tokens],
-            "slices": n_slices,
             "kv_cache_layout": getattr(kv_cache_config, "kv_cache_layout", None),
         }
         blob = json.dumps(doc, sort_keys=True, default=str).encode()

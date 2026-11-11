@@ -54,6 +54,7 @@ class _Spec:
     block_size: int
     page_size_bytes: int
     max_tp_shards: int | None = None
+    num_kv_heads: int | None = None  # per TP rank, as vLLM's
 
 
 class FullAttentionSpec(_Spec):
@@ -112,6 +113,31 @@ def test_layout_saves_each_shard_once_per_socket(sockets, savers):
     assert ns.savers == savers
     (one,) = build_layout(cfg, Parallel(4), {}).namespaces
     assert ns.namespace == one.namespace
+
+
+@pytest.mark.parametrize(
+    "spec,par,same",
+    [
+        pytest.param(MLAAttentionSpec(8, 576), Parallel(4), True, id="mla-tp4"),
+        pytest.param(MLAAttentionSpec(8, 576), Parallel(2, 2), True, id="mla-pcp"),
+        pytest.param(MLAAttentionSpec(4, 288), Parallel(2, 1, 2), True, id="mla-dcp"),
+        pytest.param(MLAAttentionSpec(2, 144), Parallel(2, 2, 4), True, id="mla-dcp=tp*pcp"),
+        pytest.param(MLAAttentionSpec(16, 1152), Parallel(2), False, id="mla-longer-block"),
+        pytest.param(FullAttentionSpec(8, 512, num_kv_heads=2), Parallel(4), True, id="gqa-tp4"),
+    ],
+)
+def test_namespace_ignores_the_parallel_layout(spec, par, same):
+    """Same model and token span: one namespace for every TP/PCP/DCP layout."""
+
+    def ns(spec, par):
+        return build_layout(_Config([_Group(["l0"], spec)]), par, {"model": "m"}).namespaces[0]
+
+    ref_spec = (
+        FullAttentionSpec(8, 1024, num_kv_heads=4)
+        if isinstance(spec, FullAttentionSpec)
+        else MLAAttentionSpec(8, 576)
+    )
+    assert (ns(spec, par).namespace == ns(ref_spec, Parallel(2)).namespace) is same
 
 
 @pytest.mark.parametrize(
