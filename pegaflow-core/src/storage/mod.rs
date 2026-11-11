@@ -23,6 +23,7 @@ use crate::metrics::{SERVED_ROLE_BACKUP_TARGET, SERVED_ROLE_SOURCE, core_metrics
 use crate::pinned_pool::{PinnedAllocation, PinnedAllocator};
 use pegaflow_common::NumaNode;
 
+pub(crate) use prefetch::MembersPoll;
 use prefetch::PrefetchScheduler;
 #[cfg(feature = "rdma")]
 use prefetch::RdmaFetch;
@@ -452,18 +453,26 @@ impl StorageEngine {
     }
 
     /// Position-aligned membership lookup in the resident read cache: entry
-    /// `i` is the sealed block for `hashes[i]`, or `None` on miss. Hashes must
-    /// already carry any group encoding (see `group_hash`).
-    pub(crate) fn get_membership(
-        &self,
-        namespace: &str,
-        hashes: &[Vec<u8>],
-    ) -> Vec<Option<Arc<crate::block::SealedBlock>>> {
-        let keys: Vec<BlockKey> = hashes
-            .iter()
-            .map(|hash| BlockKey::new(namespace.to_string(), hash.clone()))
-            .collect();
-        self.read_cache.get_blocks_aligned(&keys)
+    /// `i` is the sealed block for `keys[i]`, or `None` on miss. Key hashes
+    /// must already carry any group encoding (see `group_hash`).
+    pub(crate) fn get_blocks_aligned(&self, keys: &[BlockKey]) -> Vec<Option<Arc<SealedBlock>>> {
+        self.read_cache.get_blocks_aligned(keys)
+    }
+
+    /// Resident blocks of `keys`, position-aligned, without touching the LRU.
+    pub(crate) fn peek_blocks(&self, keys: &[BlockKey]) -> Vec<Option<Arc<SealedBlock>>> {
+        self.read_cache.peek_blocks(keys)
+    }
+
+    /// Start fetching `keys` of one namespace for `id`, each on its own;
+    /// see [`PrefetchScheduler::start_members`].
+    pub(crate) fn start_members(&self, id: &str, keys: Vec<BlockKey>) -> bool {
+        self.prefetch.start_members(id, keys)
+    }
+
+    /// Poll the fetch [`Self::start_members`] started for `id`.
+    pub(crate) async fn poll_members(&self, id: &str) -> MembersPoll {
+        self.prefetch.poll_members(&self.read_cache, id).await
     }
 
     /// Evict all blocks from the resident in-memory read cache.

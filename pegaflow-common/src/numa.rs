@@ -31,6 +31,25 @@ impl NumaNode {
     pub fn is_valid(&self) -> bool {
         self.0 != u32::MAX
     }
+
+    /// CPU socket (`physical_package_id`) of this node, read from sysfs once
+    /// per process. `None` when unknown.
+    pub fn socket(&self) -> Option<u32> {
+        static SOCKETS: std::sync::LazyLock<HashMap<u32, u32>> = std::sync::LazyLock::new(|| {
+            read_cpu_topology_from_sysfs()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(node, cpus)| {
+                    let path = format!(
+                        "/sys/devices/system/cpu/cpu{}/topology/physical_package_id",
+                        cpus.first()?
+                    );
+                    Some((node, fs::read_to_string(path).ok()?.trim().parse().ok()?))
+                })
+                .collect()
+        });
+        SOCKETS.get(&self.0).copied()
+    }
 }
 
 impl std::fmt::Display for NumaNode {

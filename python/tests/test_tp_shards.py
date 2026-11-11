@@ -146,7 +146,7 @@ def test_worker_connector_routes_global_tp_rank_to_its_local_server(monkeypatch)
     client_factory.assert_called_once_with("http://node-b:50055")
 
 
-def test_scheduler_opens_a_local_topology_session_on_every_server(monkeypatch):
+def test_scheduler_opens_a_session_on_every_server(monkeypatch):
     first = MagicMock()
     second = MagicMock()
     client_factory = MagicMock(side_effect=[first, second])
@@ -155,16 +155,11 @@ def test_scheduler_opens_a_local_topology_session_on_every_server(monkeypatch):
 
     connector = PegaKVConnector(_vllm_config(), KVConnectorRole.SCHEDULER)
     try:
-        first.start_session_watcher.assert_called_once()
-        first_session = first.start_session_watcher.call_args.args
-        assert first_session[0] == "instance"
-        assert first_session[1].endswith(":tp-shard-0-of-2")
-        assert first_session[2:] == (4, 4)
-        second.start_session_watcher.assert_called_once()
-        second_session = second.start_session_watcher.call_args.args
-        assert second_session[0] == "instance"
-        assert second_session[1].endswith(":tp-shard-1-of-2")
-        assert second_session[2:] == (4, 4)
+        for index, client in enumerate((first, second)):
+            client.start_session_watcher.assert_called_once()
+            instance_id, namespace = client.start_session_watcher.call_args.args
+            assert instance_id == "instance"
+            assert namespace.endswith(f":tp-shard-{index}-of-2")
     finally:
         connector.shutdown()
 

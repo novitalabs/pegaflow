@@ -3,18 +3,24 @@ use pegaflow_core::{trace_in_span, trace_root};
 use crate::metric::record_rpc_result;
 use crate::proto::engine::engine_server::Engine;
 use crate::proto::engine::{
-    HealthRequest, HealthResponse, LoadRequest, LoadResponse, QueryBlocksForTransferRequest,
-    QueryBlocksForTransferResponse, QueryLoading, QueryReady, QueryRequest, QueryResponse,
+    HealthRequest, HealthResponse, LoadObjectsRequest, LoadObjectsResponse, LoadRequest,
+    LoadResponse, QueryBlocksForTransferRequest, QueryBlocksForTransferResponse, QueryLoading,
+    QueryObjectRequest, QueryObjectResponse, QueryReady, QueryRequest, QueryResponse,
     RdmaHandshakeRequest, RdmaHandshakeResponse, RegisterContextRequest, RegisterContextResponse,
-    ReleaseRequest, ReleaseResponse, ReleaseTransferLockRequest, ReleaseTransferLockResponse,
-    ResponseStatus, SaveRequest, SaveResponse, SessionEvent, SessionRequest, ShutdownRequest,
+    RegisterContextV2, RegisterContextV2Response, ReleaseRequest, ReleaseResponse,
+    ReleaseTransferLockRequest, ReleaseTransferLockResponse, ResponseStatus, SaveObjectsRequest,
+    SaveObjectsResponse, SaveRequest, SaveResponse, SessionEvent, SessionRequest, ShutdownRequest,
     ShutdownResponse, TransferBlockInfo, TransferMode as ProtoTransferMode, TransferSlotInfo,
-    UnregisterRequest, UnregisterResponse, load_block_target, query_response,
+    UnregisterRequest, UnregisterResponse, load_block_target, query_object_response,
+    query_response,
 };
 use crate::registry::RegistryHandle;
 use crate::session::SessionRegistry;
 use log::{debug, info, warn};
-use pegaflow_core::{EngineError, LayerSave, PegaEngine, PrefetchStatus, QueryLeaseId};
+use pegaflow_core::{
+    EngineError, LayerSave, NamespaceMeta, ObjectKey, ObjectQueryStatus, ObjectSpans, PegaEngine,
+    PrefetchStatus, QueryLeaseId, Span,
+};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Notify, mpsc};
@@ -116,18 +122,23 @@ impl GrpcEngineService {
         Ok(())
     }
 
-    fn validate_register_context_request(req: &RegisterContextRequest) -> Result<(), Status> {
+    fn validate_client_version(client_version: &str) -> Result<(), Status> {
         let server_version = env!("CARGO_PKG_VERSION");
-        if req.client_version != server_version {
+        if client_version != server_version {
             return Err(Status::failed_precondition(format!(
                 "PegaFlow version mismatch: client={} server={server_version}",
-                if req.client_version.is_empty() {
+                if client_version.is_empty() {
                     "<missing>"
                 } else {
-                    &req.client_version
+                    client_version
                 }
             )));
         }
+        Ok(())
+    }
+
+    fn validate_register_context_request(req: &RegisterContextRequest) -> Result<(), Status> {
+        Self::validate_client_version(&req.client_version)?;
         Self::validate_device_id(req.device_id)?;
         if req.tp_size == 0 {
             return Err(Status::invalid_argument("tp_size must be > 0"));
@@ -163,6 +174,63 @@ impl GrpcEngineService {
             return Err(Status::invalid_argument("req_id must not be empty"));
         }
         Ok(())
+    }
+
+    fn digest(bytes: Vec<u8>, field: &str) -> Result<[u8; 32], Status> {
+        bytes.try_into().map_err(|b: Vec<u8>| {
+            Status::invalid_argument(format!("{field} has {} bytes, expected 32", b.len()))
+        })
+    }
+
+    fn object_key(key: Option<crate::proto::engine::ObjectKey>) -> Result<ObjectKey, Status> {
+        let key = key.ok_or_else(|| Status::invalid_argument("object key is missing"))?;
+        Ok(ObjectKey {
+            namespace: Self::digest(key.namespace, "namespace")?,
+            prefix: Self::digest(key.prefix, "prefix")?,
+        })
+    }
+
+    fn object_spans(
+        list: Vec<crate::proto::engine::ObjectSpans>,
+    ) -> Result<Vec<ObjectSpans>, Status> {
+        list.into_iter()
+            .map(|o| {
+                Ok(ObjectSpans {
+                    key: Self::object_key(o.key)?,
+                    region: o.region_idx,
+                    spans: o
+                        .span
+                        .iter()
+                        .map(|raw| Span::decode(raw).map_err(Status::invalid_argument))
+                        .collect::<Result<_, _>>()?,
+                })
+            })
+            .collect()
+    }
+
+    /// The RPC V2 reply status of `result`: business errors travel in it,
+    /// not as a gRPC status.
+    fn v2_status<T>(result: &Result<T, Status>) -> ResponseStatus {
+        match result {
+            Ok(_) => Self::ok_status(),
+            Err(status) => ResponseStatus {
+                ok: false,
+                message: format!("{}: {}", status.code(), status.message()),
+            },
+        }
+    }
+
+    fn log_v2<T>(method: &'static str, result: &Result<T, Status>, start: Instant, detail: &str) {
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        match result {
+            Ok(_) => debug!("RPC [{method}] completed: ok {detail} elapsed_ms={elapsed_ms:.2}"),
+            Err(status) => warn!(
+                "RPC [{method}] failed: code={} message={} {detail} elapsed_ms={elapsed_ms:.2}",
+                status.code(),
+                status.message(),
+            ),
+        }
+        record_rpc_result(method, result, start);
     }
 
     fn build_register_context_response() -> RegisterContextResponse {
@@ -1021,21 +1089,18 @@ impl Engine for GrpcEngineService {
         &self,
         request: Request<SessionRequest>,
     ) -> Result<Response<Self::SessionStream>, Status> {
-        let req = request.into_inner();
-        let instance_id = req.instance_id;
+        let SessionRequest {
+            instance_id,
+            namespace,
+        } = request.into_inner();
         if instance_id.is_empty() {
             return Err(Status::invalid_argument("instance_id must not be empty"));
         }
 
-        let token = self.session_registry.install(
-            instance_id.clone(),
-            req.namespace.clone(),
-            req.tp_size,
-            req.world_size,
-        );
+        let token = self.session_registry.install(instance_id.clone());
         info!(
-            "Session opened: instance_id={} namespace={} tp_size={} world_size={} token={}",
-            instance_id, req.namespace, req.tp_size, req.world_size, token
+            "Session opened: instance_id={} namespace={} token={}",
+            instance_id, namespace, token
         );
 
         // Channel capacity is 1: we don't emit events yet, and a tight capacity
@@ -1072,6 +1137,243 @@ impl Engine for GrpcEngineService {
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    async fn register_context_v2(
+        &self,
+        request: Request<RegisterContextV2>,
+    ) -> Result<Response<RegisterContextV2Response>, Status> {
+        let start = Instant::now();
+        let req = request.into_inner();
+        let transfer_mode = match req.transfer_mode() {
+            ProtoTransferMode::Direct => pegaflow_core::TransferMode::Direct,
+            ProtoTransferMode::Kernel => pegaflow_core::TransferMode::Kernel,
+        };
+        let RegisterContextV2 {
+            instance_id,
+            namespace_meta,
+            regions,
+            client_version,
+            ..
+        } = req;
+        let detail = format!(
+            "instance_id={instance_id} namespaces={} regions={}",
+            namespace_meta.len(),
+            regions.len()
+        );
+        let result: Result<(), Status> = async {
+            Self::validate_client_version(&client_version)?;
+            if instance_id.is_empty() {
+                return Err(Status::invalid_argument("instance_id must not be empty"));
+            }
+            let first = namespace_meta
+                .first()
+                .ok_or_else(|| Status::invalid_argument("namespace_meta must not be empty"))?;
+            let (rank, device_id) = (first.rank, first.device_id);
+            if namespace_meta
+                .iter()
+                .any(|m| m.rank != rank || m.device_id != device_id)
+            {
+                return Err(Status::invalid_argument(
+                    "every namespace_meta of one request must name the same rank and device_id",
+                ));
+            }
+            let device_id = i32::try_from(device_id)
+                .map_err(|_| Status::invalid_argument(format!("device_id {device_id}")))?;
+            let namespaces = namespace_meta
+                .into_iter()
+                .map(|m| {
+                    Ok(NamespaceMeta {
+                        namespace: Self::digest(m.namespace, "namespace")?,
+                        world_size: m.world_size,
+                        layer_names: m.layer_names,
+                        bytes_per_block: m.bytes_per_block,
+                        block_size: m.block_size,
+                        local_hidden: m.local_hidden,
+                        interleave_token: m.interleave_token,
+                        saver_rank: m.saver_rank,
+                    })
+                })
+                .collect::<Result<Vec<_>, Status>>()?;
+            let regions: Vec<(Vec<u8>, u64)> =
+                regions.into_iter().map(|r| (r.ipc_handle, r.size)).collect();
+            info!(
+                "RPC [register_context_v2]: instance_id={instance_id} rank={rank} device_id={device_id} \
+                 namespaces={} regions={}",
+                namespaces.len(),
+                regions.len()
+            );
+            // Opening IPC handles and starting the copy workers block.
+            let engine = Arc::clone(&self.engine);
+            let instance = instance_id.clone();
+            tokio::task::spawn_blocking(move || {
+                engine.register_context_v2(
+                    &instance,
+                    rank,
+                    device_id,
+                    namespaces,
+                    &regions,
+                    transfer_mode,
+                )
+            })
+            .await
+            .map_err(|e| Status::internal(format!("register task panicked: {e}")))?
+            .map_err(Self::map_engine_error)
+        }
+        .await;
+        Self::log_v2("register_context_v2", &result, start, &detail);
+        Ok(Response::new(RegisterContextV2Response {
+            status: Some(Self::v2_status(&result)),
+        }))
+    }
+
+    async fn query_object(
+        &self,
+        request: Request<QueryObjectRequest>,
+    ) -> Result<Response<QueryObjectResponse>, Status> {
+        let start = Instant::now();
+        let QueryObjectRequest {
+            instance_id,
+            keys,
+            prefix_search,
+            query_id,
+        } = request.into_inner();
+        trace_root!("rpc.query_object", root, || {
+            [
+                ("instance_id", instance_id.clone()),
+                ("keys", keys.len().to_string()),
+                ("prefix_search", prefix_search.to_string()),
+            ]
+        });
+        let detail = format!(
+            "instance_id={instance_id} keys={} prefix_search={prefix_search}",
+            keys.len()
+        );
+        let fut = async {
+            let keys = keys
+                .into_iter()
+                .map(|k| Self::object_key(Some(k)))
+                .collect::<Result<Vec<_>, Status>>()?;
+            let query_id = (!query_id.is_empty()).then_some(query_id.as_str());
+            self.engine
+                .query_object(&instance_id, query_id, &keys, prefix_search)
+                .await
+                .map_err(Self::map_engine_error)
+        };
+        let result = trace_in_span!(root, fut).await;
+        Self::log_v2("query_object", &result, start, &detail);
+        let status = Some(Self::v2_status(&result));
+        let Ok((query_id, answer)) = result else {
+            return Ok(Response::new(QueryObjectResponse {
+                status,
+                ..Default::default()
+            }));
+        };
+        let outcome = match answer {
+            ObjectQueryStatus::Loading => query_object_response::Outcome::Loading(QueryLoading {}),
+            ObjectQueryStatus::Ready {
+                hits,
+                lease,
+                hit_positions,
+            } => query_object_response::Outcome::Ready(QueryReady {
+                num_hit_blocks: hits as u64,
+                lease: lease.map(|l| l.to_bytes().to_vec()).unwrap_or_default(),
+                hit_positions,
+            }),
+        };
+        Ok(Response::new(QueryObjectResponse {
+            outcome: Some(outcome),
+            query_id,
+            status,
+        }))
+    }
+
+    async fn save_objects(
+        &self,
+        request: Request<SaveObjectsRequest>,
+    ) -> Result<Response<SaveObjectsResponse>, Status> {
+        let start = Instant::now();
+        let SaveObjectsRequest {
+            instance_id,
+            rank,
+            writes,
+        } = request.into_inner();
+        trace_root!("rpc.save_objects", root, || {
+            [
+                ("instance_id", instance_id.clone()),
+                ("objects", writes.len().to_string()),
+            ]
+        });
+        let detail = format!(
+            "instance_id={instance_id} rank={rank} objects={}",
+            writes.len()
+        );
+        let fut = async {
+            let writes = Self::object_spans(writes)?;
+            self.engine
+                .save_objects(&instance_id, rank, &writes)
+                .await
+                .map_err(Self::map_engine_error)
+        };
+        let result = trace_in_span!(root, fut).await;
+        Self::log_v2("save_objects", &result, start, &detail);
+        Ok(Response::new(SaveObjectsResponse {
+            status: Some(Self::v2_status(&result)),
+        }))
+    }
+
+    async fn load_objects(
+        &self,
+        request: Request<LoadObjectsRequest>,
+    ) -> Result<Response<LoadObjectsResponse>, Status> {
+        let start = Instant::now();
+        let LoadObjectsRequest {
+            instance_id,
+            rank,
+            device_id,
+            load_state_shm,
+            spans,
+            lease,
+        } = request.into_inner();
+        trace_root!("rpc.load_objects", root, || {
+            [
+                ("instance_id", instance_id.clone()),
+                ("objects", spans.len().to_string()),
+                ("leases", lease.len().to_string()),
+            ]
+        });
+        let detail = format!(
+            "instance_id={instance_id} rank={rank} objects={} leases={}",
+            spans.len(),
+            lease.len()
+        );
+        let fut = async {
+            if load_state_shm.is_empty() {
+                return Err(Status::invalid_argument("load_state_shm must not be empty"));
+            }
+            let device_id = i32::try_from(device_id)
+                .map_err(|_| Status::invalid_argument(format!("device_id {device_id}")))?;
+            let spans = Self::object_spans(spans)?;
+            let leases = lease
+                .iter()
+                .map(|l| QueryLeaseId::from_bytes(l).map_err(Status::invalid_argument))
+                .collect::<Result<Vec<_>, _>>()?;
+            self.engine
+                .load_objects(
+                    &instance_id,
+                    rank,
+                    device_id,
+                    &spans,
+                    &leases,
+                    &load_state_shm,
+                )
+                .map_err(Self::map_engine_error)
+        };
+        let result = trace_in_span!(root, fut).await;
+        Self::log_v2("load_objects", &result, start, &detail);
+        Ok(Response::new(LoadObjectsResponse {
+            status: Some(Self::v2_status(&result)),
+        }))
     }
 }
 

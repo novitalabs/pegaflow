@@ -247,8 +247,6 @@ async fn mock_vllm_session_disconnect_cleans_instance() {
     let session = harness.open_session().await;
     assert_eq!(session.request.instance_id, INSTANCE_ID);
     assert_eq!(session.request.namespace, "mock-vllm");
-    assert_eq!(session.request.tp_size, 1);
-    assert_eq!(session.request.world_size, 1);
 
     let save = harness.save_blocks(&hashes).await;
     assert_response_ok(save.response.status.as_ref(), "save before session cleanup");

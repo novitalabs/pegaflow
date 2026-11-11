@@ -11,7 +11,7 @@ use mea::singleflight::Group;
 use pegaflow_proto::proto::engine::engine_client::EngineClient;
 use pegaflow_proto::proto::engine::{
     FetchSegment, QueryBlocksForTransferRequest, QueryBlocksForTransferResponse,
-    RdmaHandshakeRequest, TransferBlockInfo, TransferSlotInfo,
+    QueryPrefixBlocksResponse, RdmaHandshakeRequest, TransferBlockInfo, TransferSlotInfo,
 };
 use pegaflow_transfer::{ConnectionStatus, HandshakeMetadata, TransferDesc, TransferOp};
 use tonic::transport::{Channel, Endpoint};
@@ -248,38 +248,64 @@ impl RdmaFetchStore {
         namespace: &str,
         hashes: &[Vec<u8>],
     ) -> Option<FetchPlan> {
-        if hashes.is_empty() {
-            return None;
-        }
-
-        let segments = match self
-            .metaserver_client
-            .query_plan(namespace, hashes, &self.advertise_addr)
-            .await
-        {
-            Ok(segments) => segments,
-            Err(e) => {
-                warn!("MetaServer query failed for remote fetch: {e}");
-                return None;
-            }
-        };
-
-        let plan = match validate_fetch_plan(segments, hashes.len(), &self.advertise_addr) {
-            Ok(plan) => plan?,
-            Err(error) => {
-                warn!("MetaServer returned invalid remote fetch plan: {error}");
-                return None;
-            }
-        };
-
+        let resp = self.query(namespace, hashes, false).await?;
+        let plan = self.validate(resp.segments, hashes.len())?;
         debug!(
             "Remote prefix query: segments={} prefix={}/{}",
             plan.segments.len(),
             plan.block_count,
             hashes.len(),
         );
-
         Some(plan)
+    }
+
+    /// Query MetaServer for the `hashes` peers hold, wherever they are: their
+    /// ascending indexes and a plan over those hashes in that order.
+    pub(crate) async fn query_members(
+        &self,
+        namespace: &str,
+        hashes: &[Vec<u8>],
+    ) -> Option<(Vec<usize>, FetchPlan)> {
+        let resp = self.query(namespace, hashes, true).await?;
+        let found: Vec<usize> = resp.found.iter().map(|&i| i as usize).collect();
+        if found.windows(2).any(|w| w[0] >= w[1]) || found.last() >= Some(&hashes.len()) {
+            warn!(
+                "MetaServer returned invalid member indexes for {} hashes",
+                hashes.len()
+            );
+            return None;
+        }
+        let plan = self.validate(resp.segments, found.len())?;
+        debug!(
+            "Remote member query: segments={} found={}/{} planned={}",
+            plan.segments.len(),
+            found.len(),
+            hashes.len(),
+            plan.block_count,
+        );
+        Some((found, plan))
+    }
+
+    async fn query(
+        &self,
+        namespace: &str,
+        hashes: &[Vec<u8>],
+        members: bool,
+    ) -> Option<QueryPrefixBlocksResponse> {
+        if hashes.is_empty() {
+            return None;
+        }
+        self.metaserver_client
+            .query_plan(namespace, hashes, &self.advertise_addr, members)
+            .await
+            .inspect_err(|e| warn!("MetaServer query failed for remote fetch: {e}"))
+            .ok()
+    }
+
+    fn validate(&self, segments: Vec<FetchSegment>, hash_count: usize) -> Option<FetchPlan> {
+        validate_fetch_plan(segments, hash_count, &self.advertise_addr)
+            .inspect_err(|e| warn!("MetaServer returned invalid remote fetch plan: {e}"))
+            .ok()?
     }
 
     pub(crate) async fn fetch_plan(

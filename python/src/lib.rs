@@ -1,15 +1,18 @@
 use pegaflow_common::grpc::{GRPC_CLIENT_HTTP2_KEEPALIVE_INTERVAL, GRPC_CONNECT_TIMEOUT};
 use pegaflow_core::LoadState;
 use pegaflow_proto::proto::engine::{
-    HealthRequest, LeaseLoad, LoadBlockIds, LoadBlockTarget, LoadGroup, LoadRequest, QueryRequest,
-    RegisterContextRequest, ReleaseRequest, ResponseStatus, SaveLayer, SaveRequest, SessionEvent,
-    SessionRequest, ShutdownRequest, TransferMode, UnregisterRequest, engine_client::EngineClient,
-    load_block_target, query_response,
+    DeviceRegion, HealthRequest, LeaseLoad, LoadBlockIds, LoadBlockTarget, LoadGroup,
+    LoadObjectsRequest, LoadRequest, NamespaceMeta, ObjectKey, ObjectSpans, QueryObjectRequest,
+    QueryRequest, RegisterContextRequest, RegisterContextV2, ReleaseRequest, ResponseStatus,
+    SaveLayer, SaveObjectsRequest, SaveRequest, SessionEvent, SessionRequest, ShutdownRequest,
+    TransferMode, UnregisterRequest, engine_client::EngineClient, load_block_target,
+    query_object_response, query_response,
 };
 use pyo3::{
     create_exception,
     exceptions::{PyException, PyRuntimeError, PyValueError},
     prelude::*,
+    types::PyDict,
 };
 use std::{
     future::Future,
@@ -32,6 +35,10 @@ create_exception!(pegaflow, PegaflowInternal, PegaFlowError);
 
 static TOKIO_RUNTIME: OnceLock<Runtime> = OnceLock::new();
 type PyLeaseLoad = (Vec<u8>, Vec<Vec<Option<u32>>>);
+/// `((namespace, prefix), region_idx, packed spans)`; spans are `<QQ`
+/// `(offset, len)` pairs back to back.
+type PyObjectSpans = (PyObjectKey, u32, Vec<u8>);
+type PyObjectKey = (Vec<u8>, Vec<u8>);
 
 /// Get or create the global Tokio runtime (shared across all RPC calls)
 fn get_runtime() -> PyResult<&'static Runtime> {
@@ -78,6 +85,76 @@ fn expect_status(method: &str, status: Option<ResponseStatus>) -> PyResult<Respo
 fn status_tuple(method: &str, status: Option<ResponseStatus>) -> PyResult<(bool, String)> {
     let status = expect_status(method, status)?;
     Ok((status.ok, status.message))
+}
+
+fn transfer_mode(backend: &str) -> PyResult<TransferMode> {
+    match backend {
+        "direct" => Ok(TransferMode::Direct),
+        "kernel" => Ok(TransferMode::Kernel),
+        other => Err(PyValueError::new_err(format!(
+            "unknown transfer_backend '{other}' (expected 'direct' or 'kernel')"
+        ))),
+    }
+}
+
+/// Raise `ValueError` on a V2 business error; V2 handlers report them in
+/// `status` instead of the gRPC status.
+fn check_v2_status(method: &str, status: Option<ResponseStatus>) -> PyResult<()> {
+    let status = expect_status(method, status)?;
+    if status.ok {
+        Ok(())
+    } else {
+        Err(PyValueError::new_err(format!(
+            "{method} rejected: {}",
+            status.message
+        )))
+    }
+}
+
+fn object_key((namespace, prefix): PyObjectKey) -> ObjectKey {
+    ObjectKey { namespace, prefix }
+}
+
+fn object_spans(objects: Vec<PyObjectSpans>) -> PyResult<Vec<ObjectSpans>> {
+    objects
+        .into_iter()
+        .map(|(key, region_idx, packed)| {
+            if packed.len() % 16 != 0 {
+                return Err(PyValueError::new_err(format!(
+                    "packed spans are {} bytes, not a multiple of 16",
+                    packed.len()
+                )));
+            }
+            Ok(ObjectSpans {
+                key: Some(object_key(key)),
+                region_idx,
+                span: packed.chunks_exact(16).map(<[u8]>::to_vec).collect(),
+            })
+        })
+        .collect()
+}
+
+fn namespace_meta(meta: &Bound<'_, PyDict>) -> PyResult<NamespaceMeta> {
+    fn field<'py, T: FromPyObjectOwned<'py>>(meta: &Bound<'py, PyDict>, name: &str) -> PyResult<T> {
+        meta.get_item(name)?
+            .ok_or_else(|| PyValueError::new_err(format!("namespace meta misses '{name}'")))?
+            .extract()
+            .map_err(Into::into)
+    }
+    let optional =
+        |name: &str| -> PyResult<u64> { meta.get_item(name)?.map_or(Ok(0), |v| v.extract()) };
+    Ok(NamespaceMeta {
+        namespace: field(meta, "namespace")?,
+        world_size: field(meta, "world_size")?,
+        device_id: field(meta, "device_id")?,
+        rank: field(meta, "rank")?,
+        layer_names: field(meta, "layer_names")?,
+        bytes_per_block: field(meta, "bytes_per_block")?,
+        block_size: field(meta, "block_size")?,
+        local_hidden: field(meta, "local_hidden")?,
+        interleave_token: optional("interleave_token")?,
+        saver_rank: field(meta, "saver_rank")?,
+    })
 }
 
 fn u64_to_usize(value: u64, field: &str) -> PyResult<usize> {
@@ -309,15 +386,7 @@ impl EngineRpcClient {
         page_first: bool,
         layer_group_ids: Option<Vec<u32>>,
     ) -> PyResult<(bool, String)> {
-        let transfer_mode = match transfer_backend {
-            "direct" => TransferMode::Direct,
-            "kernel" => TransferMode::Kernel,
-            other => {
-                return Err(PyValueError::new_err(format!(
-                    "unknown transfer_backend '{other}' (expected 'direct' or 'kernel')"
-                )));
-            }
-        };
+        let transfer_mode = transfer_mode(transfer_backend)?;
         self.call(py, "register_context_batch", |mut c| async move {
             let resp = c
                 .register_context_batch(RegisterContextRequest {
@@ -539,6 +608,184 @@ impl EngineRpcClient {
         })
     }
 
+    /// RPC V2: register this rank's namespaces and device regions.
+    ///
+    /// Args:
+    ///     instance_id: Model instance ID, shared by every rank
+    ///     namespace_metas: One dict per namespace with keys `namespace`
+    ///         (32 bytes), `world_size`, `device_id`, `rank`, `layer_names`,
+    ///         `bytes_per_block`, `block_size`, `local_hidden`, `saver_rank`
+    ///         and optional `interleave_token`
+    ///     regions: `(ipc_handle, size, name)` per whole cuMemAlloc allocation;
+    ///         span `region_idx` indexes this list
+    ///     transfer_backend: "kernel" (default) or "direct"
+    ///
+    /// Raises:
+    ///     ValueError: If the server rejects the registration.
+    #[pyo3(signature = (instance_id, namespace_metas, regions, transfer_backend = "kernel"))]
+    fn register_context_v2(
+        &self,
+        py: Python<'_>,
+        instance_id: String,
+        namespace_metas: Vec<Bound<'_, PyDict>>,
+        regions: Vec<(Vec<u8>, u64, String)>,
+        transfer_backend: &str,
+    ) -> PyResult<()> {
+        let request = RegisterContextV2 {
+            instance_id,
+            namespace_meta: namespace_metas
+                .iter()
+                .map(namespace_meta)
+                .collect::<PyResult<_>>()?,
+            regions: regions
+                .into_iter()
+                .map(|(ipc_handle, size, name)| DeviceRegion {
+                    ipc_handle,
+                    size,
+                    name,
+                })
+                .collect(),
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            transfer_mode: transfer_mode(transfer_backend)? as i32,
+        };
+        self.call(py, "register_context_v2", |mut c| async move {
+            Ok(c.register_context_v2(request).await?.into_inner())
+        })
+        .and_then(|r| check_v2_status("register_context_v2", r.status))
+    }
+
+    /// RPC V2: copy objects from this rank's HBM to the server. Returns once
+    /// the copy is done; the objects seal once every saver wrote every layer.
+    ///
+    /// Args:
+    ///     instance_id: Model instance ID
+    ///     rank: This rank; must be a saver of each object's namespace
+    ///     writes: `((namespace, prefix), region_idx, spans)` per object, where
+    ///         `spans` packs `struct.pack("<QQ", offset, len)` for every layer
+    ///         in `layer_names` order
+    ///
+    /// Raises:
+    ///     ValueError: If the server rejects the save.
+    fn save_objects(
+        &self,
+        py: Python<'_>,
+        instance_id: String,
+        rank: u32,
+        writes: Vec<PyObjectSpans>,
+    ) -> PyResult<()> {
+        let request = SaveObjectsRequest {
+            instance_id,
+            rank,
+            writes: object_spans(writes)?,
+        };
+        self.call(py, "save_objects", |mut c| async move {
+            Ok(c.save_objects(request).await?.into_inner())
+        })
+        .and_then(|r| check_v2_status("save_objects", r.status))
+    }
+
+    /// RPC V2: look up objects of one namespace.
+    ///
+    /// `prefix_search=True` counts consecutive hits from `keys[0]`;
+    /// `False` reports every hit position and fetches misses from SSD and
+    /// peers first. While fetching the answer is `QueryLoading`; poll with
+    /// the returned query id and the same keys.
+    ///
+    /// Args:
+    ///     instance_id: Model instance ID
+    ///     keys: `(namespace, prefix)` pairs, all of one namespace
+    ///     prefix_search: Leading hits (True) or every key held anywhere,
+    ///         fetching the misses first (False)
+    ///     query_id: Id of the query being polled; empty for a new one
+    ///
+    /// Returns:
+    ///     `(query_id, QueryLoading | QueryReady)`
+    ///
+    /// Raises:
+    ///     ValueError: If the server rejects the query.
+    #[pyo3(signature = (instance_id, keys, prefix_search, query_id = String::new()))]
+    fn query_object(
+        &self,
+        py: Python<'_>,
+        instance_id: String,
+        keys: Vec<PyObjectKey>,
+        prefix_search: bool,
+        query_id: String,
+    ) -> PyResult<(String, Py<PyAny>)> {
+        let request = QueryObjectRequest {
+            instance_id,
+            keys: keys.into_iter().map(object_key).collect(),
+            prefix_search,
+            query_id,
+        };
+        let resp = self.call(py, "query_object", |mut c| async move {
+            Ok(c.query_object(request).await?.into_inner())
+        })?;
+        check_v2_status("query_object", resp.status)?;
+        let outcome = match resp.outcome {
+            Some(query_object_response::Outcome::Loading(_)) => {
+                Py::new(py, QueryLoading {})?.into_any()
+            }
+            Some(query_object_response::Outcome::Ready(ready)) => Py::new(
+                py,
+                QueryReady {
+                    num_hit_blocks: u64_to_usize(ready.num_hit_blocks, "num_hit_blocks")?,
+                    lease: PyQueryLease(ready.lease),
+                    hit_positions: ready.hit_positions,
+                },
+            )?
+            .into_any(),
+            None => {
+                return Err(PyRuntimeError::new_err(
+                    "query_object response missing outcome",
+                ));
+            }
+        };
+        Ok((resp.query_id, outcome))
+    }
+
+    /// RPC V2: copy leased objects into this rank's HBM. Returns once the
+    /// request is accepted; completion lands in the `PyLoadState`. Each lease
+    /// is consumed once per call and released after `world_size` calls.
+    ///
+    /// Args:
+    ///     instance_id: Model instance ID
+    ///     rank: This rank
+    ///     device_id: This rank's GPU; must match its registration
+    ///     load_state_shm: `PyLoadState.shm_name()`
+    ///     spans: Destinations, shaped like `save_objects` writes
+    ///     leases: Leases from `query_object` holding every loaded key
+    ///
+    /// Raises:
+    ///     ValueError: If the server rejects the load.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "PyO3 binding mirrors the LoadObjects request shape"
+    )]
+    fn load_objects(
+        &self,
+        py: Python<'_>,
+        instance_id: String,
+        rank: u32,
+        device_id: u32,
+        load_state_shm: String,
+        spans: Vec<PyObjectSpans>,
+        leases: Vec<PyQueryLease>,
+    ) -> PyResult<()> {
+        let request = LoadObjectsRequest {
+            instance_id,
+            rank,
+            device_id,
+            load_state_shm,
+            spans: object_spans(spans)?,
+            lease: leases.into_iter().map(PyQueryLease::into_proto).collect(),
+        };
+        self.call(py, "load_objects", |mut c| async move {
+            Ok(c.load_objects(request).await?.into_inner())
+        })
+        .and_then(|r| check_v2_status("load_objects", r.status))
+    }
+
     /// Release a query lease.
     fn release(&self, py: Python<'_>, lease: PyQueryLease) -> PyResult<()> {
         self.call(py, "release", |mut c| async move {
@@ -588,21 +835,17 @@ impl EngineRpcClient {
     /// Call once per client, typically from the scheduler role. Calling
     /// again replaces the previous stream (the old Streaming drops and the
     /// server's old session is superseded by the new one).
-    #[pyo3(signature = (instance_id, namespace, tp_size, world_size))]
+    #[pyo3(signature = (instance_id, namespace))]
     fn start_session_watcher(
         &self,
         py: Python<'_>,
         instance_id: String,
         namespace: String,
-        tp_size: u32,
-        world_size: u32,
     ) -> PyResult<()> {
         let mut client = self.client.clone();
         let req = SessionRequest {
             instance_id,
             namespace,
-            tp_size,
-            world_size,
         };
         let stream = self.call(py, "session", move |_| async move {
             let resp = client.session(req).await?;

@@ -68,9 +68,11 @@ cargo bench --bench uds_latency
      - `ssd_cache.rs`: SSD-backed block storage
      - `uring.rs`: io_uring async I/O
    - `pinned_pool.rs` / `pinned_mem.rs`: NUMA-aware pinned memory allocator
-   - `transfer.rs`: GPU-CPU transfer operations via CUDA
+   - `transfer/`: GPU-CPU transfer operations via CUDA (block copy kernel, DMA copy-engine backend)
    - `cache.rs`: LRU cache for blocks
    - `gpu_worker.rs`: Per-GPU worker handling async operations
+   - `objects.rs`: RPC V2 objects: namespace registration, per-rank slices, save/load/query over the block store
+   - `lease.rs`: Query leases for KV blocks and objects (consumer counts, TTL sweep)
    - `internode/`: Cross-node communication
      - `metaserver_client.rs`: MetaServer registration, removal, query, and node heartbeat
 
@@ -97,6 +99,7 @@ cargo bench --bench uds_latency
 7. **python/** (Rust/PyO3 + Python): Python package (`pegaflow-llm` on PyPI)
    - `src/lib.rs`: PyO3 bindings exposing `PegaEngine` and gRPC client
    - `pegaflow/connector/`: vLLM v1 KV connector (scheduler + worker split)
+   - `pegaflow/connector_v2/`: vLLM KV connector on RPC V2 objects (`semantics.py` resume rules, `layout.py` cache groups to namespaces)
    - `pegaflow/ipc_wrapper.py`: CUDA IPC handle wrapper
    - CLI binaries: `pegaflow-server`, `pegaflow-metaserver` (installed via pip)
 
@@ -149,6 +152,12 @@ vLLM Worker <--gRPC--> PegaEngine Server <--CUDA IPC--> GPU Memory
 - Stub and mock tests are allowed only for local contracts and must not shadow real runtime modules during integration/e2e collection.
 - Prefer integration tests when they prove a real boundary that units cannot. Prefer units when they give faster, clearer feedback for local connector state machines.
 
+## KV Block and Object Paths
+
+- The server has two client paths: v1 KV blocks (`RegisterContextBatch`, `Save`, `Load`, `QueryPrefetch`) and RPC V2 byte-addressed objects (`RegisterContextV2`, `SaveObjects`, `LoadObjects`, `QueryObject`).
+- A deployment uses one path or the other, never both on the same server. Do not add handling for mixed v1/v2 traffic: separate metrics, SSD/prefetch budget splits, or cross-path lease checks.
+- v1 behavior must stay unchanged when touching shared code (insert worker, read cache, prefetch, SSD, RDMA); objects reuse it as ordinary sealed blocks, one slot per (saver, layer).
+
 ## Compatibility & Durability
 
 - We have a strict version handshake (`CARGO_PKG_VERSION` exact match at registration), so do NOT design for backward compatibility with older clients or older stored formats — bump the version and break freely.
@@ -175,6 +184,8 @@ vLLM Worker <--gRPC--> PegaEngine Server <--CUDA IPC--> GPU Memory
 - `pegaflow-core/src/storage/prefetch.rs`: SSD/RDMA prefetch state machine
 - `pegaflow-core/src/storage/transfer_lock.rs`: Transfer lock manager for RDMA transfers
 - `pegaflow-core/src/storage/write_path.rs`: Async insert worker thread
+- `pegaflow-core/src/objects.rs`: Byte-addressed object RPCs (v2 path)
+- `pegaflow-core/src/lease.rs`: Query leases for KV blocks and objects
 - `pegaflow-core/src/backing/ssd.rs`: SSD backing store coordinator
 - `pegaflow-core/src/internode/metaserver_client.rs`: MetaServer registration, query, and node heartbeat
 - `pegaflow-server/src/service.rs`: gRPC service implementation
@@ -186,3 +197,4 @@ vLLM Worker <--gRPC--> PegaEngine Server <--CUDA IPC--> GPU Memory
 - `python/pegaflow/pegaflow.pyi`: Type stubs for PyO3 bindings
 - `python/pegaflow/connector/scheduler.py`: vLLM scheduler-side connector
 - `python/pegaflow/connector/worker.py`: vLLM worker-side connector
+- `python/pegaflow/connector_v2/`: vLLM connector on RPC V2 (`PegaKVConnectorV2`)

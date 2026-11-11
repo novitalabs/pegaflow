@@ -235,10 +235,7 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
             # server-side cleanup of the instance's CUDA IPC mappings.
             for index, client in enumerate(query_clients):
                 client.start_session_watcher(
-                    instance_id,
-                    tp_shards.namespace(base_namespace, index),
-                    self._ctx.effective_tp_size,
-                    self._ctx.effective_world_size,
+                    instance_id, tp_shards.namespace(base_namespace, index)
                 )
         else:
             self._worker = WorkerConnector(

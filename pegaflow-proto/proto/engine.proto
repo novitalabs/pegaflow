@@ -191,8 +191,6 @@ message HealthResponse {
 message SessionRequest {
   string instance_id = 1;
   string namespace   = 2;
-  uint32 tp_size     = 3;
-  uint32 world_size  = 4;
 }
 
 message SessionEvent {
@@ -252,6 +250,137 @@ message ReleaseTransferLockResponse {
   uint64 released_blocks = 2;
 }
 
+// ---- RPC V2: namespaced, byte-addressed objects ----
+//
+// An object is keyed by (namespace, prefix), two 32-byte digests the client
+// computes. A namespace is one KV kind with all its layers; the server only
+// compares its bytes and never branches on what it describes. Each rank
+// registers its namespaces and device regions once, then saves and loads the
+// bytes of every layer of an object in one span list. The server cuts those
+// bytes into one slot per (saver rank, layer), seals the object once every
+// slot arrived, and stores it as a KV block, sharing the pinned pool, LRU,
+// SSD cache, RDMA fetch and MetaServer with v1.
+
+message DeviceRegion {
+  // CUipcMemHandle of a whole cuMemAlloc allocation (64 bytes).
+  bytes ipc_handle = 1;
+  // Bytes of that allocation. Span offsets count from its start; the client
+  // adds where its KV tensor sits inside the allocation.
+  uint64 size = 2;
+  string name = 3;
+}
+
+message NamespaceMeta {
+  // 32-byte digest identifying this namespace; equals ObjectKey.namespace of
+  // every object saved, queried or loaded under it.
+  bytes namespace = 1;
+  uint32 world_size = 2;
+  // Caller's device and rank; the same in every NamespaceMeta of one request.
+  uint32 device_id = 3;
+  uint32 rank = 4;
+  // Layers of this namespace, in the order spans list them.
+  repeated string layer_names = 5;
+  // Bytes of one layer of the whole object (one block, full hidden width,
+  // K and V together) as stored on the server. Not the per-rank slice and
+  // not multiplied by replicas.
+  uint64 bytes_per_block = 6;
+  // Tokens per block, e.g. 64.
+  uint64 block_size = 7;
+  // Bytes one rank holds per token in one layer (K and V together).
+  // bytes_per_block / (local_hidden * block_size) is the number of slices
+  // one layer is split into: 1 means every rank holds a full replica.
+  uint64 local_hidden = 8;
+  // For DCP. Stored as given; not read by this version.
+  uint64 interleave_token = 9;
+  // Ranks that write this namespace, e.g. [0, 4] for MLA over two NUMA nodes.
+  repeated uint32 saver_rank = 10;
+}
+
+message RegisterContextV2 {
+  string instance_id = 1;
+  repeated NamespaceMeta namespace_meta = 2;
+  // One registration may carry several regions. ObjectSpans.region_idx in
+  // Save / Load is the index into this list, in registration order.
+  repeated DeviceRegion regions = 3;
+  string client_version = 4;
+  // H2D/D2H transfer backend the client chose for this rank's copies.
+  TransferMode transfer_mode = 5;
+}
+
+message RegisterContextV2Response {
+  ResponseStatus status = 1;
+}
+
+message ObjectKey {
+  // 32-byte digest of everything that decides the object's bytes besides the
+  // token prefix (model, state layout, dtype, ...). Must equal the
+  // NamespaceMeta.namespace this instance registered.
+  bytes namespace = 1;
+  // 32-byte digest of the token prefix the object covers.
+  bytes prefix = 2;
+}
+
+message ObjectSpans {
+  ObjectKey key = 1;
+  uint32 region_idx = 2;  // index into RegisterContextV2.regions, registration order
+  // [offset, len, offset, len, ...] covering every layer of the namespace in
+  // layer_names order; within one layer, in the client's own order (e.g. K
+  // then V under layer-first). Save and Load of the same key list them in the
+  // same order. Each element is exactly 16 bytes: offset u64 LE, len u64 LE,
+  // offset counted from the start of the region's allocation.
+  repeated bytes span = 3;
+}
+
+message SaveObjectsRequest {
+  string instance_id = 1;
+  uint32 rank = 2;
+  repeated ObjectSpans writes = 3;
+}
+
+message SaveObjectsResponse {
+  ResponseStatus status = 1;
+}
+
+message QueryObjectRequest {
+  string instance_id = 1;
+  // One namespace, in order: prefix queries count from keys[0], membership
+  // queries answer indexes into this list.
+  repeated ObjectKey keys = 2;
+  // True: the leading keys held. False: every key held in memory, on SSD or
+  // at a peer; the misses found elsewhere are fetched first.
+  bool prefix_search = 3;
+  // Optional; the server generates one when empty. Poll a Loading answer
+  // with the same query_id and keys.
+  string query_id = 4;
+}
+
+message QueryObjectResponse {
+  oneof outcome {
+    QueryLoading loading = 1;
+    QueryReady ready = 2;
+  }
+  string query_id = 3;
+  ResponseStatus status = 4;
+}
+
+message LoadObjectsRequest {
+  string instance_id = 1;
+  uint32 rank = 2;
+  // Must equal the device_id this rank registered.
+  uint32 device_id = 3;
+  // A LoadState the server sets once the copies finish or fail; the reply
+  // comes as soon as the request is checked.
+  string load_state_shm = 4;
+  repeated ObjectSpans spans = 5;
+  // Each lease is consumed once by this request and released after
+  // world_size consumes.
+  repeated bytes lease = 6;
+}
+
+message LoadObjectsResponse {
+  ResponseStatus status = 1;
+}
+
 service Engine {
   rpc RegisterContextBatch(RegisterContextRequest) returns (RegisterContextResponse);
   rpc Save(SaveRequest) returns (SaveResponse);
@@ -271,6 +400,13 @@ service Engine {
   // Liveness channel: server drops the instance's CUDA IPC mappings when
   // this stream closes (vllm process dies or disconnects).
   rpc Session(SessionRequest) returns (stream SessionEvent);
+  // RPC V2. The method and the message share the name RegisterContextV2;
+  // inside the service scope a bare name resolves to the method first, so
+  // the parameter type is fully qualified.
+  rpc RegisterContextV2(.pegaflow.RegisterContextV2) returns (RegisterContextV2Response);
+  rpc SaveObjects(SaveObjectsRequest) returns (SaveObjectsResponse);
+  rpc QueryObject(QueryObjectRequest) returns (QueryObjectResponse);
+  rpc LoadObjects(LoadObjectsRequest) returns (LoadObjectsResponse);
 }
 
 // MetaServer service for managing block hash keys across multi-node instances
@@ -311,6 +447,9 @@ message QueryPrefixBlocksRequest {
   string namespace = 1;
   repeated bytes block_hashes = 2;  // ordered by prefix position
   string exclude_node = 3;          // requester address; never return it as an owner
+  // Membership instead of prefix semantics: hashes no peer holds are skipped
+  // rather than ending the plan, and `found` lists the hashes it covers.
+  bool members = 4;
 }
 
 message FetchSegment {
@@ -321,7 +460,10 @@ message FetchSegment {
 message QueryPrefixBlocksResponse {
   reserved 1;
   reserved "nodes";
+  // Over the leading hashes, or with `members` over the `found` ones in order.
   repeated FetchSegment segments = 2;
+  // With `members`: ascending indexes into `block_hashes` the segments cover.
+  repeated uint32 found = 3;
 }
 
 // Block hashes of one namespace, oldest first.

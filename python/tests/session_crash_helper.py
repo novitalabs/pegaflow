@@ -58,7 +58,7 @@ def main() -> int:
         print(f"register_context_batch failed: {msg}", file=sys.stderr)
         return 1
 
-    client.start_session_watcher(instance_id, "test-ns", 1, 1)
+    client.start_session_watcher(instance_id, "test-ns")
 
     with open(ready_file, "w") as f:
         f.write("ready")

@@ -277,8 +277,6 @@ impl MockVllmRpcHarness {
         let request = SessionRequest {
             instance_id: INSTANCE_ID.to_string(),
             namespace: NAMESPACE.to_string(),
-            tp_size: self.workers.len() as u32,
-            world_size: self.workers.len() as u32,
         };
         let stream = self
             .scheduler
