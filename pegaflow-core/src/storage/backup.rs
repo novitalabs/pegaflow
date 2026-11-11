@@ -128,7 +128,7 @@ async fn pull_once(
             &req_id,
             &plan.namespace,
             &wanted,
-            FetchPurpose::Members,
+            FetchPurpose::Backup,
         )
         .await;
     let missing = wanted.len() - fetched.len();

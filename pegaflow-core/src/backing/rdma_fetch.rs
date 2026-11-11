@@ -52,10 +52,11 @@ pub(crate) enum FetchPurpose {
     /// A request's missing prefix: a gap ends it, at the holder and across
     /// the plan's segments.
     Prefix,
-    /// Blocks that stand on their own (membership queries, decode-backup
-    /// pulls): the holder returns every block it still has, and a gap stops
-    /// nothing.
+    /// Keys of a membership query, each on its own: the holder returns every
+    /// block it still has, and a gap stops nothing.
     Members,
+    /// A decode-backup pull: as `Members`, under its own metric label.
+    Backup,
 }
 
 impl FetchPurpose {
@@ -63,6 +64,7 @@ impl FetchPurpose {
         match self {
             Self::Prefix => "prefix",
             Self::Members => "members",
+            Self::Backup => "backup",
         }
     }
 
