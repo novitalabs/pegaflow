@@ -37,7 +37,7 @@ Poll a `Loading` answer with the returned `query_id` and the same keys.
 
 ## vLLM Connector
 
-`python/pegaflow/connector_v2` (`kv_connector="PegaKVConnectorV2"`, `kv_connector_module_path="pegaflow.connector_v2"`) is the vLLM client of these RPCs. It handles TP only, with full attention, MLA, sliding-window and Mamba (`align`) cache groups.
+`python/pegaflow/connector_v2` (`kv_connector="PegaKVConnectorV2"`, `kv_connector_module_path="pegaflow.connector_v2"`) is the vLLM client of these RPCs. It handles TP, PCP and DCP (no PP), with full attention, MLA, sliding-window and Mamba (`align`) cache groups.
 
 - Each vLLM cache group is one namespace. The 32-byte namespace hashes the model identity and the group spec. The object prefix is the vLLM block hash of the group's last token block.
 - `semantics.py` says what resuming at token `p` needs from each group: every block for full attention, the last `W - 1` tokens for a window, and the one state at `p` for a checkpoint. `resolve` picks the largest `p` that every group can back.
@@ -46,6 +46,7 @@ Poll a `Loading` answer with the returned `query_id` and the same keys.
 - Saves follow `semantics.saveable`. Mamba states are saved only from vLLM's `boundary_state_offloads`. A saved block stays pinned in vLLM's block pool until every rank reports the save done.
 - `policy.py` holds the per-model choices, as v1 defaults them. A pure-attention model (full and MLA groups only) saves one copy per slice. A hybrid model (any window or checkpoint group) saves one copy per slice on each CPU socket, so loads read a copy on their own socket. MLA models copy with the kernel and all others with direct copies; `pegaflow.transfer_backend` overrides.
 - vLLM 0.32 keeps a rank's whole KV cache in one allocation, so each rank registers one region. The span of block `b` in layer `l` is `offset_l + b × block_stride_l` with length `page_size_bytes`.
+- PCP and DCP are handled on the client side; the server only sees slices. `world_size` is `tp × pcp`. PCP ranks hold the same bytes. Under DCP one vLLM block covers `block_size × dcp` tokens and each DCP rank holds its own share of them, so a DCP-sharded group has `dcp` times as many slices. The connector numbers server ranks so the ranks holding one slice are consecutive, as `slice = rank × S / world_size` needs: vLLM's DCP groups span PCP first, so with `dcp = tp × pcp` the server rank order differs from vLLM's world rank order.
 
 Run the E2E suite with `PEGAFLOW_E2E_CONNECTOR=v2` to use it.
 
@@ -54,7 +55,7 @@ Run the E2E suite with `PEGAFLOW_E2E_CONNECTOR=v2` to use it.
 - An RDMA fetch moves an object slot by slot, so both copies of a hybrid MLA model cross the network. The result is correct, but the traffic is doubled.
 - Repeated queries may prefetch remote objects that are never loaded.
 - Objects go to the saver's NUMA node only. With one copy of a replicated slice (MLA), the pinned pools of the other ranks' nodes stay unused. This matters on hosts with several NUMA nodes per socket; v1 stripes MLA saves over every rank instead.
-- No pipeline parallelism: `world_size` is the TP size.
+- No pipeline parallelism.
 - No cross-config sharing: objects saved under one TP layout cannot be loaded under another. Same-node deployments always share a config. Cross-node re-layout, if ever needed, belongs in the RDMA layer.
-- Saver ranks and socket placement are not part of the namespace digest. Instances sharing a namespace must use compatible TP layouts, replica counts for each slice, and slot-to-slice ordering. E2E runs must verify and record these before testing cache sharing.
-- DCP is not supported: `interleave_token` is stored but not read.
+- Saver ranks, socket placement and the DCP interleave size (`cp_kv_cache_interleave_size`) are not part of the namespace digest. Instances sharing a namespace must use compatible TP/PCP/DCP layouts, replica counts for each slice, slot-to-slice ordering and interleave size. E2E runs must verify and record these before testing cache sharing.
+- `interleave_token` in `NamespaceMeta` is stored but not read; the connector sends 0.

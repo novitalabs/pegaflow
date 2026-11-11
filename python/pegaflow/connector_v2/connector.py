@@ -1,16 +1,16 @@
 """vLLM entry point: ``PegaKVConnectorV2`` over RPC V2 objects.
 
 Thin translation between vLLM's connector API and ``scheduler`` / ``worker``.
-Supported: Full, MLA, sliding-window and Mamba (``align``) cache groups, TP
-only. Failed loads follow vLLM's ``kv_load_failure_policy``. Stats and
-Prometheus metrics are v1's.
+Supported: Full, MLA, sliding-window and Mamba (``align``) cache groups, over
+TP, PCP and DCP (no PP). Failed loads follow vLLM's ``kv_load_failure_policy``.
+Stats and Prometheus metrics are v1's.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -87,14 +87,16 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
         from pegaflow import EngineRpcClient
 
         pc = vllm_config.parallel_config
-        for name in ("pipeline_parallel_size", "decode_context_parallel_size"):
-            if getattr(pc, name, 1) > 1:
-                raise Unsupported(f"connector v2 supports TP only, got {name}={getattr(pc, name)}")
-        tp_rank = 0
+        if pc.pipeline_parallel_size > 1:
+            raise Unsupported(f"connector v2 does not support PP, got {pc.pipeline_parallel_size}")
+        par = Parallel(
+            pc.tensor_parallel_size,
+            pc.prefill_context_parallel_size,
+            pc.decode_context_parallel_size,
+        )
+        world_rank = 0
         if role == KVConnectorRole.WORKER:
-            from vllm.distributed.parallel_state import get_tp_group
-
-            tp_rank = get_tp_group().rank_in_group
+            world_rank = _world_rank(par)
         mc, cc = vllm_config.model_config, vllm_config.cache_config
         identity = {
             "model": mc.model,
@@ -105,14 +107,13 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
             "hash_algo": getattr(cc, "prefix_caching_hash_algo", None),
         }
         extra = self._kv_transfer_config.kv_connector_extra_config or {}
-        par = Parallel(pc.tensor_parallel_size)
         self._layout = build_layout(kv_cache_config, par, identity)
         is_mla = getattr(mc.hf_text_config, "kv_lora_rank", None) is not None  # v1 detect_mla
         self._policy = Policy.of(
             self._layout.groups, is_mla, extra.get("pegaflow.transfer_backend")
         )
         if self._policy.copy_per_socket:
-            par = Parallel(pc.tensor_parallel_size, _tp_sockets(pc.tensor_parallel_size))
+            par = replace(par, sockets=_rank_sockets(par.world_size))
             self._layout = build_layout(kv_cache_config, par, identity)
         host = os.environ.get("PEGAFLOW_HOST") or extra.get("pegaflow.host", "http://127.0.0.1")
         port = os.environ.get("PEGAFLOW_PORT") or extra.get("pegaflow.port", 50055)
@@ -143,8 +144,8 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
                 self._layout,
                 self._rpc,
                 self._instance_id,
-                rank=tp_rank,
-                world_size=pc.tensor_parallel_size,
+                rank=self._layout.ranks[world_rank],
+                world_size=self._layout.world_size,
                 device_id=_server_device_id(),
                 new_load_state=PyLoadState,
                 mark_compute=_mark_compute,
@@ -332,8 +333,22 @@ def _server_device_id() -> int:
     return int(entries[local])
 
 
-def _tp_sockets(tp_size: int) -> tuple[int, ...]:
-    """CPU socket (``physical_package_id``) next to each TP rank's GPU, from
+def _world_rank(par: Parallel) -> int:
+    """This worker's rank in its instance's TP x PCP grid."""
+    from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group, get_tp_group
+
+    pcp_rank = get_pcp_group().rank_in_group if par.pcp_size > 1 else 0
+    rank = par.world_rank(get_tp_group().rank_in_group, pcp_rank)
+    if par.dcp_size > 1 and par.dcp_rank(rank) != get_dcp_group().rank_in_group:
+        raise Unsupported(
+            f"vLLM's DCP rank {get_dcp_group().rank_in_group} differs from the "
+            f"connector's {par.dcp_rank(rank)} for world rank {rank}"
+        )
+    return rank
+
+
+def _rank_sockets(world_size: int) -> tuple[int, ...]:
+    """CPU socket (``physical_package_id``) next to each world rank's GPU, from
     NVML and sysfs without touching CUDA, so the scheduler and every worker
     compute the same list. Unknown: all 0, one socket."""
     from vllm.platforms import current_platform
@@ -343,7 +358,7 @@ def _tp_sockets(tp_size: int) -> tuple[int, ...]:
         pynvml.nvmlInit()
         try:
             out = []
-            for r in range(tp_size):
+            for r in range(world_size):
                 gpu = current_platform.device_id_to_physical_device_id(r)
                 bus = pynvml.nvmlDeviceGetPciInfo(pynvml.nvmlDeviceGetHandleByIndex(gpu)).busId
                 out.append(_pci_socket(bus.decode() if isinstance(bus, bytes) else bus))
@@ -352,7 +367,7 @@ def _tp_sockets(tp_size: int) -> tuple[int, ...]:
             pynvml.nvmlShutdown()
     except Exception:
         logger.warning("[PegaKVConnectorV2] GPU sockets unknown: one socket", exc_info=True)
-        return (0,) * tp_size
+        return (0,) * world_size
 
 
 def _pci_socket(bus_id: str) -> int:

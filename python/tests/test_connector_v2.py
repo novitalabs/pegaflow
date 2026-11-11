@@ -60,6 +60,10 @@ class FullAttentionSpec(_Spec):
     pass
 
 
+class MLAAttentionSpec(_Spec):
+    pass
+
+
 @dataclass
 class SlidingWindowSpec(_Spec):
     sliding_window: int = 8
@@ -104,10 +108,47 @@ def test_layout_orders_full_first_and_splits_heads():
 )
 def test_layout_saves_each_shard_once_per_socket(sockets, savers):
     cfg = _Config([_Group(["f0"], FullAttentionSpec(4, 1024, max_tp_shards=2))])
-    (ns,) = build_layout(cfg, Parallel(4, sockets), {}).namespaces
+    (ns,) = build_layout(cfg, Parallel(4, sockets=sockets), {}).namespaces
     assert ns.savers == savers
     (one,) = build_layout(cfg, Parallel(4), {}).namespaces
     assert ns.namespace == one.namespace
+
+
+@pytest.mark.parametrize(
+    "spec,par,ranks,slices,savers",
+    [
+        # PCP replicates the cache: one slice, world ranks keep their order.
+        pytest.param(MLAAttentionSpec(4, 576), Parallel(2, 2), (0, 1, 2, 3), 1, (0,), id="pcp"),
+        # DCP over the PCP axis: the DCP rank is the PCP rank.
+        pytest.param(
+            MLAAttentionSpec(4, 576), Parallel(2, 2, 2), (0, 1, 2, 3), 2, (0, 2), id="dcp=pcp"
+        ),
+        # DCP over TP x PCP spans PCP first: server ranks reorder world ranks 1, 2.
+        pytest.param(
+            MLAAttentionSpec(4, 576),
+            Parallel(2, 2, 4),
+            (0, 2, 1, 3),
+            4,
+            (0, 1, 2, 3),
+            id="dcp=tp*pcp",
+        ),
+        # Two head shards x DCP2 over TP4: every rank holds a distinct part.
+        pytest.param(
+            FullAttentionSpec(4, 512, max_tp_shards=2),
+            Parallel(4, 1, 2),
+            (0, 1, 2, 3),
+            4,
+            (0, 1, 2, 3),
+            id="gqa-dcp",
+        ),
+    ],
+)
+def test_layout_maps_dcp_and_pcp_ranks(spec, par, ranks, slices, savers):
+    layout = build_layout(_Config([_Group(["l0"], spec)]), par, {})
+    (ns,) = layout.namespaces
+    # One vLLM block spans block_size tokens on each DCP rank.
+    assert ns.group == sem.Group(sem.FULL, 4 * par.dcp_size)
+    assert (layout.ranks, ns.slices, ns.savers) == (ranks, slices, savers)
 
 
 @pytest.mark.parametrize(
