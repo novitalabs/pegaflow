@@ -46,20 +46,23 @@ const LOCK_TIMEOUT_MARGIN: Duration = Duration::from_secs(60);
 /// still fixed-size per model and keeps the allocation count bounded.
 const PER_SLOT_ALLOC_MIN_BYTES: u64 = 256 * 1024;
 
-/// Why a node pulls blocks from a peer; selects holder semantics and labels.
+/// How a node pulls blocks from a peer; selects holder semantics and labels.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FetchPurpose {
-    /// Serve a request's missing prefix; the holder stops at the first gap.
+    /// A request's missing prefix: a gap ends it, at the holder and across
+    /// the plan's segments.
     Prefix,
-    /// Copy a decode-backup plan; the holder returns every block it still has.
-    Backup,
+    /// Blocks that stand on their own (membership queries, decode-backup
+    /// pulls): the holder returns every block it still has, and a gap stops
+    /// nothing.
+    Members,
 }
 
 impl FetchPurpose {
     fn label(self) -> &'static str {
         match self {
             Self::Prefix => "prefix",
-            Self::Backup => "backup",
+            Self::Members => "members",
         }
     }
 
@@ -180,6 +183,7 @@ struct RdmaSegmentFetcher<'a> {
     store: &'a RdmaFetchStore,
     req_id: &'a str,
     namespace: &'a str,
+    purpose: FetchPurpose,
 }
 
 #[tonic::async_trait]
@@ -191,16 +195,21 @@ impl SegmentFetcher for RdmaSegmentFetcher<'_> {
                 self.req_id,
                 self.namespace,
                 hashes,
-                FetchPurpose::Prefix,
+                self.purpose,
             )
             .await
     }
 }
 
+/// Fetch every segment of `plan` in order. A prefix plan ends at the first
+/// short segment, as it ends the contiguous remote prefix; a members plan
+/// goes on to the next. Returns the blocks, the full segments and the first
+/// short one as (index, planned, returned).
 async fn execute_fetch_plan<F: SegmentFetcher>(
     fetcher: &F,
     plan: &FetchPlan,
     hashes: &[Vec<u8>],
+    purpose: FetchPurpose,
 ) -> (PrefetchResult, usize, Option<(usize, usize, usize)>) {
     let mut fetched = Vec::with_capacity(plan.block_count);
     let mut completed_segments = 0usize;
@@ -208,17 +217,18 @@ async fn execute_fetch_plan<F: SegmentFetcher>(
 
     for (index, segment) in plan.segments.iter().enumerate() {
         let expected = &hashes[segment.start..segment.end];
-        // The holder answers with `prefix_only`, so `returned` is a prefix of
-        // `expected`; a short segment ends the contiguous remote prefix.
         let returned = fetcher.fetch_segment(&segment.node, expected).await;
         let returned_count = returned.len();
         fetched.extend(returned);
 
-        if returned_count != expected.len() {
-            failed_segment = Some((index, expected.len(), returned_count));
-            break;
+        if returned_count == expected.len() {
+            completed_segments += 1;
+        } else {
+            failed_segment.get_or_insert((index, expected.len(), returned_count));
+            if purpose == FetchPurpose::Prefix {
+                break;
+            }
         }
-        completed_segments += 1;
     }
 
     (fetched, completed_segments, failed_segment)
@@ -314,15 +324,17 @@ impl RdmaFetchStore {
         req_id: &str,
         namespace: &str,
         hashes: &[Vec<u8>],
+        purpose: FetchPurpose,
     ) -> PrefetchResult {
         let started_at = Instant::now();
         let fetcher = RdmaSegmentFetcher {
             store: self,
             req_id,
             namespace,
+            purpose,
         };
         let (fetched, completed_segments, failure) =
-            execute_fetch_plan(&fetcher, plan, hashes).await;
+            execute_fetch_plan(&fetcher, plan, hashes, purpose).await;
         let metrics = core_metrics();
         metrics
             .rdma_fetch_plan_segments
@@ -428,7 +440,7 @@ async fn rdma_fetch_task(
         namespace,
         block_hashes,
         advertise_addr,
-        purpose == FetchPurpose::Prefix,
+        purpose,
     )
     .await
     {
@@ -886,7 +898,7 @@ async fn query_remote_blocks(
     namespace: &str,
     block_hashes: &[Vec<u8>],
     advertise_addr: &str,
-    prefix_only: bool,
+    purpose: FetchPurpose,
 ) -> Result<(EngineClient<Channel>, QueryBlocksForTransferResponse), String> {
     let mut client = get_or_create_channel(grpc_channels, remote_addr)?;
 
@@ -894,9 +906,8 @@ async fn query_remote_blocks(
         namespace: namespace.to_string(),
         block_hashes: block_hashes.to_vec(),
         requester_id: advertise_addr.to_string(),
-        // Prefix fetch keeps only the contiguous prefix; never lock blocks past a gap.
-        // Backup copies are independent blocks, so a gap must not stop the rest.
-        prefix_only,
+        // The holder never locks prefix blocks past a gap.
+        prefix_only: purpose == FetchPurpose::Prefix,
     };
 
     let response = client
@@ -1065,7 +1076,8 @@ mod tests {
         };
         let hashes = vec![vec![1], vec![2], vec![3]];
 
-        let (fetched, completed, failure) = execute_fetch_plan(&fetcher, &plan, &hashes).await;
+        let (fetched, completed, failure) =
+            execute_fetch_plan(&fetcher, &plan, &hashes, FetchPurpose::Prefix).await;
 
         assert_eq!(fetched.len(), 3);
         assert_eq!(completed, 2);
@@ -1080,34 +1092,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_plan_stops_after_first_short_segment() {
-        let plan = validate_fetch_plan(
-            vec![
-                segment("node-a", 1),
-                segment("node-b", 1),
-                segment("node-c", 1),
-            ],
-            3,
-            "requester",
-        )
-        .unwrap()
-        .unwrap();
-        let fetcher = FakeSegmentFetcher {
-            calls: Mutex::new(Vec::new()),
-            responses: Mutex::new(VecDeque::from([
-                vec![fetched_block(1)],
-                Vec::new(),
-                vec![fetched_block(3)],
-            ])),
-        };
-        let hashes = vec![vec![1], vec![2], vec![3]];
+    async fn short_segment_ends_prefix_plans_only() {
+        // (purpose, blocks fetched, segments asked)
+        for (purpose, fetched_count, calls) in
+            [(FetchPurpose::Prefix, 1, 2), (FetchPurpose::Members, 2, 3)]
+        {
+            let plan = validate_fetch_plan(
+                vec![
+                    segment("node-a", 1),
+                    segment("node-b", 1),
+                    segment("node-c", 1),
+                ],
+                3,
+                "requester",
+            )
+            .unwrap()
+            .unwrap();
+            let fetcher = FakeSegmentFetcher {
+                calls: Mutex::new(Vec::new()),
+                responses: Mutex::new(VecDeque::from([
+                    vec![fetched_block(1)],
+                    Vec::new(),
+                    vec![fetched_block(3)],
+                ])),
+            };
+            let hashes = vec![vec![1], vec![2], vec![3]];
 
-        let (fetched, completed, failure) = execute_fetch_plan(&fetcher, &plan, &hashes).await;
+            let (fetched, completed, failure) =
+                execute_fetch_plan(&fetcher, &plan, &hashes, purpose).await;
 
-        assert_eq!(fetched.len(), 1);
-        assert_eq!(completed, 1);
-        assert_eq!(failure, Some((1, 1, 0)));
-        assert_eq!(fetcher.calls.lock().unwrap().len(), 2);
+            assert_eq!(fetched.len(), fetched_count, "{purpose:?}");
+            assert_eq!(completed, fetched_count, "{purpose:?}");
+            assert_eq!(failure, Some((1, 1, 0)), "{purpose:?}");
+            assert_eq!(fetcher.calls.lock().unwrap().len(), calls, "{purpose:?}");
+        }
     }
 
     #[test]
