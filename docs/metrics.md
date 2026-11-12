@@ -164,7 +164,7 @@ Active only when the MetaServer runs with `--enable-decode-backup`.
   - Blocks fully copied by a peer from this node
   - Labels: `role` (`source` demotes its copies; `backup_target` keeps them retained). On a target this is the recall volume
 
-- **pegaflow_rdma_fetch_total / _bytes / _duration** gain a `purpose` label (`prefix` for request prefix fetches, `members` for RPC V2 membership queries, `backup` for decode backup pulls)
+- **pegaflow_rdma_fetch_total / _bytes / _duration** gain a `purpose` label (`prefix` for request prefix fetches, `members` for RPC V2 membership queries, `backup` for decode backup pulls); `pegaflow_rdma_fetch_plan_segments` and `pegaflow_rdma_fetch_plan_completed_segments` carry the same `purpose`
 
 MetaServer (`--http-addr` `/metrics`):
 

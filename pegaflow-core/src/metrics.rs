@@ -549,14 +549,14 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
             #[cfg(feature = "rdma")]
             rdma_fetch_plan_segments: meter
                 .u64_histogram("pegaflow_rdma_fetch_plan_segments")
-                .with_description("Number of segments planned per executed RDMA fetch plan")
+                .with_description("Number of segments planned per executed RDMA fetch plan, by purpose")
                 .with_boundaries(rdma_fetch_plan_segment_boundaries())
                 .build(),
             #[cfg(feature = "rdma")]
             rdma_fetch_plan_completed_segments: meter
                 .u64_histogram("pegaflow_rdma_fetch_plan_completed_segments")
                 .with_description(
-                    "Number of segments completed before an RDMA fetch plan stopped",
+                    "Number of full segments of an RDMA fetch plan, by purpose; a prefix plan stops at its first short segment",
                 )
                 .with_boundaries(rdma_fetch_plan_segment_boundaries())
                 .build(),
