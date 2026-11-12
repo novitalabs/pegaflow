@@ -10,7 +10,7 @@ use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 
 #[cfg(feature = "rdma")]
-use crate::backing::RdmaFetchStore;
+use crate::backing::{FetchPurpose, RdmaFetchStore};
 use crate::backing::{PrefetchResult, SsdBackingStore};
 use crate::block::{BlockKey, PrefetchStatus, SealedBlock};
 use crate::internode::MetaServerClient;
@@ -51,7 +51,13 @@ impl RdmaFetch {
         }
         let blocks = self
             .0
-            .fetch_plan(&plan, req_id, namespace, remaining_hashes)
+            .fetch_plan(
+                &plan,
+                req_id,
+                namespace,
+                remaining_hashes,
+                FetchPurpose::Prefix,
+            )
             .await;
         if require_full_prefix && blocks.len() != found {
             // One planned segment served fewer blocks than the MetaServer
@@ -81,7 +87,10 @@ impl RdmaFetch {
             return (0, Vec::new());
         };
         let held: Vec<Vec<u8>> = found.iter().map(|&i| hashes[i].clone()).collect();
-        let blocks = self.0.fetch_plan(&plan, req_id, namespace, &held).await;
+        let blocks = self
+            .0
+            .fetch_plan(&plan, req_id, namespace, &held, FetchPurpose::Members)
+            .await;
         (held.len(), blocks)
     }
 }
