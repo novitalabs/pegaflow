@@ -2,6 +2,8 @@
 mod backup;
 mod prefetch;
 mod read_cache;
+mod read_cache_clock;
+mod read_cache_lru;
 mod tier_attribution;
 pub(crate) mod transfer_lock;
 mod write_path;
@@ -27,6 +29,7 @@ pub(crate) use prefetch::MembersPoll;
 use prefetch::PrefetchScheduler;
 #[cfg(feature = "rdma")]
 use prefetch::RdmaFetch;
+pub use read_cache::EvictionPolicy;
 pub(crate) use read_cache::{DEFAULT_BACKUP_RECLAIMABLE_PERCENT, DemotionReason, ReadCache};
 use write_path::{InsertDeps, WritePipeline};
 
@@ -45,6 +48,8 @@ pub struct MemoryCacheCleanupStats {
 
 #[derive(Clone)]
 pub struct StorageConfig {
+    /// Host-memory eviction policy. Defaults to the upstream LRU implementation.
+    pub eviction_policy: EvictionPolicy,
     pub enable_lfu_admission: bool,
     /// Optional hint for expected value size in bytes (tunes cache + allocator granularity).
     pub hint_value_size_bytes: Option<usize>,
@@ -92,6 +97,7 @@ pub const DEFAULT_BACKUP_MAX_BANDWIDTH: u64 = 2 << 30;
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
+            eviction_policy: EvictionPolicy::Lru,
             enable_lfu_admission: false,
             hint_value_size_bytes: None,
             max_prefetch_blocks: DEFAULT_MAX_PREFETCH_BLOCKS,
@@ -177,9 +183,15 @@ impl StorageEngine {
 
         // Sub-components
         let read_cache = Arc::new(
-            ReadCache::new(capacity_bytes, config.enable_lfu_admission, value_size_hint)
-                .with_backup_reclaimable_percent(config.backup_reclaimable_percent),
+            ReadCache::with_policy(
+                capacity_bytes,
+                config.enable_lfu_admission,
+                value_size_hint,
+                config.eviction_policy,
+            )
+            .with_backup_reclaimable_percent(config.backup_reclaimable_percent),
         );
+        info!("Host-memory cache eviction policy: {}", read_cache.policy());
 
         let metaserver_client = config.metaserver_addr.as_ref().map(|addr| {
             let advertise = config
@@ -581,7 +593,7 @@ impl StorageEngine {
         while largest_free < required_bytes {
             let used_before = self.allocator.usage().0;
 
-            let evicted = self.read_cache.remove_lru_batch(RECLAIM_BATCH_SIZE);
+            let evicted = self.read_cache.evict_batch(RECLAIM_BATCH_SIZE);
 
             if evicted.is_empty() {
                 break;
