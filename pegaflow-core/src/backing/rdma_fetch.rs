@@ -208,11 +208,10 @@ impl SegmentFetcher for RdmaSegmentFetcher<'_> {
     }
 }
 
-/// Fetch the segments of `plan`. A prefix plan goes in order and ends at the
-/// first short segment, as that ends the contiguous remote prefix. Segments
-/// of other plans do not depend on each other, so they go at once and a dead
-/// holder delays the plan once. Returns the blocks, the number of full
-/// segments and the first short one as (index, planned, returned).
+/// Fetch the segments of `plan` in order. A prefix plan ends at the first
+/// short segment, as that ends the contiguous remote prefix; other plans go
+/// on to the next segment. Returns the blocks, the number of full segments
+/// and the first short one as (index, planned, returned).
 async fn execute_fetch_plan<F: SegmentFetcher>(
     fetcher: &F,
     plan: &FetchPlan,
@@ -222,32 +221,18 @@ async fn execute_fetch_plan<F: SegmentFetcher>(
     let mut fetched = Vec::with_capacity(plan.block_count);
     let mut completed_segments = 0usize;
     let mut first_short = None;
-    let mut take = |index: usize, planned: usize, returned: PrefetchResult| {
-        let full = returned.len() == planned;
+    for (index, segment) in plan.segments.iter().enumerate() {
+        let expected = &hashes[segment.start..segment.end];
+        let returned = fetcher.fetch_segment(&segment.node, expected).await;
+        let full = returned.len() == expected.len();
         if full {
             completed_segments += 1;
         } else {
-            first_short.get_or_insert((index, planned, returned.len()));
+            first_short.get_or_insert((index, expected.len(), returned.len()));
         }
         fetched.extend(returned);
-        full
-    };
-
-    if purpose == FetchPurpose::Prefix {
-        for (index, segment) in plan.segments.iter().enumerate() {
-            let expected = &hashes[segment.start..segment.end];
-            let returned = fetcher.fetch_segment(&segment.node, expected).await;
-            if !take(index, expected.len(), returned) {
-                break;
-            }
-        }
-    } else {
-        let all = futures::future::join_all(plan.segments.iter().map(|segment| {
-            fetcher.fetch_segment(&segment.node, &hashes[segment.start..segment.end])
-        }))
-        .await;
-        for (index, (segment, returned)) in plan.segments.iter().zip(all).enumerate() {
-            take(index, segment.end - segment.start, returned);
+        if !full && purpose == FetchPurpose::Prefix {
+            break;
         }
     }
 
