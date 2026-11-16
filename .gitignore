@@ -16,6 +16,9 @@ examples/bench_results/
 examples/pd_logs/
 python/tests/*.log
 
+# Local benchmark evidence
+docs/benchmarks/**/logs/
+
 # Built binaries in Python package (generated during wheel build)
 python/pegaflow/pegaflow-server
 python/pegaflow/pegaflow-server-py

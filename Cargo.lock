@@ -1911,6 +1911,7 @@ dependencies = [
  "ahash",
  "bytesize",
  "criterion",
+ "crossbeam-epoch",
  "cudarc",
  "dashmap",
  "fastrace",
