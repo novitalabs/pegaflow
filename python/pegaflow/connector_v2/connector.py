@@ -107,14 +107,15 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
             "hash_algo": getattr(cc, "prefix_caching_hash_algo", None),
         }
         extra = self._kv_transfer_config.kv_connector_extra_config or {}
-        self._layout = build_layout(kv_cache_config, par, identity)
+        kv_heads = mc.get_total_num_kv_heads()
+        self._layout = build_layout(kv_cache_config, par, identity, kv_heads)
         is_mla = getattr(mc.hf_text_config, "kv_lora_rank", None) is not None  # v1 detect_mla
         self._policy = Policy.of(
             self._layout.groups, is_mla, extra.get("pegaflow.transfer_backend")
         )
         if self._policy.copy_per_socket:
             par = replace(par, sockets=_rank_sockets(par.world_size))
-            self._layout = build_layout(kv_cache_config, par, identity)
+            self._layout = build_layout(kv_cache_config, par, identity, kv_heads)
         host = os.environ.get("PEGAFLOW_HOST") or extra.get("pegaflow.host", "http://127.0.0.1")
         port = os.environ.get("PEGAFLOW_PORT") or extra.get("pegaflow.port", 50055)
         self._rpc = EngineRpcClient(f"{host}:{port}")
@@ -126,7 +127,7 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
             self._instance_id,
             self._rpc.endpoint(),
             self._policy,
-            [(ns.gid, ns.group, ns.slices, ns.savers) for ns in self._layout.namespaces],
+            [(ns.gid, ns.group, ns.num_groups, ns.roles) for ns in self._layout.namespaces],
         )
 
         self._scheduler: Scheduler | None = None
@@ -144,8 +145,7 @@ class PegaKVConnectorV2(KVConnectorBase_V1, SupportsHMA):
                 self._layout,
                 self._rpc,
                 self._instance_id,
-                rank=self._layout.ranks[world_rank],
-                world_size=self._layout.world_size,
+                rank=world_rank,
                 device_id=_server_device_id(),
                 new_load_state=PyLoadState,
                 mark_compute=_mark_compute,

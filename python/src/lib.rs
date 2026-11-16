@@ -2,11 +2,11 @@ use pegaflow_common::grpc::{GRPC_CLIENT_HTTP2_KEEPALIVE_INTERVAL, GRPC_CONNECT_T
 use pegaflow_core::LoadState;
 use pegaflow_proto::proto::engine::{
     DeviceRegion, HealthRequest, LeaseLoad, LoadBlockIds, LoadBlockTarget, LoadGroup,
-    LoadObjectsRequest, LoadRequest, NamespaceMeta, ObjectKey, ObjectSpans, QueryObjectRequest,
-    QueryRequest, RegisterContextRequest, RegisterContextV2, ReleaseRequest, ResponseStatus,
-    SaveLayer, SaveObjectsRequest, SaveRequest, SessionEvent, SessionRequest, ShutdownRequest,
-    TransferMode, UnregisterRequest, engine_client::EngineClient, load_block_target,
-    query_object_response, query_response,
+    LoadObjectsRequest, LoadRequest, NamespaceMeta, NamespaceRole, ObjectKey, ObjectSpans,
+    QueryObjectRequest, QueryRequest, RegisterContextRequest, RegisterContextV2, ReleaseRequest,
+    ResponseStatus, SaveLayer, SaveObjectsRequest, SaveRequest, SessionEvent, SessionRequest,
+    ShutdownRequest, TransferMode, UnregisterRequest, engine_client::EngineClient,
+    load_block_target, query_object_response, query_response,
 };
 use pyo3::{
     create_exception,
@@ -134,26 +134,27 @@ fn object_spans(objects: Vec<PyObjectSpans>) -> PyResult<Vec<ObjectSpans>> {
         .collect()
 }
 
-fn namespace_meta(meta: &Bound<'_, PyDict>) -> PyResult<NamespaceMeta> {
-    fn field<'py, T: FromPyObjectOwned<'py>>(meta: &Bound<'py, PyDict>, name: &str) -> PyResult<T> {
-        meta.get_item(name)?
-            .ok_or_else(|| PyValueError::new_err(format!("namespace meta misses '{name}'")))?
+fn namespace_role(role: &Bound<'_, PyDict>) -> PyResult<NamespaceRole> {
+    fn field<'py, T: FromPyObjectOwned<'py>>(role: &Bound<'py, PyDict>, name: &str) -> PyResult<T> {
+        role.get_item(name)?
+            .ok_or_else(|| PyValueError::new_err(format!("namespace role misses '{name}'")))?
             .extract()
             .map_err(Into::into)
     }
-    let optional =
-        |name: &str| -> PyResult<u64> { meta.get_item(name)?.map_or(Ok(0), |v| v.extract()) };
-    Ok(NamespaceMeta {
-        namespace: field(meta, "namespace")?,
-        world_size: field(meta, "world_size")?,
-        device_id: field(meta, "device_id")?,
-        rank: field(meta, "rank")?,
-        layer_names: field(meta, "layer_names")?,
-        bytes_per_block: field(meta, "bytes_per_block")?,
-        block_size: field(meta, "block_size")?,
-        local_hidden: field(meta, "local_hidden")?,
-        interleave_token: optional("interleave_token")?,
-        saver_rank: field(meta, "saver_rank")?,
+    let interleave_token = role
+        .get_item("interleave_token")?
+        .map_or(Ok(0), |v| v.extract())?;
+    Ok(NamespaceRole {
+        meta: Some(NamespaceMeta {
+            namespace: field(role, "namespace")?,
+            layer_names: field(role, "layer_names")?,
+            slice_bytes: field(role, "slice_bytes")?,
+            num_groups: field(role, "num_groups")?,
+            world_size: field(role, "world_size")?,
+            interleave_token,
+        }),
+        group: field(role, "group")?,
+        save: field(role, "save")?,
     })
 }
 
@@ -608,35 +609,34 @@ impl EngineRpcClient {
         })
     }
 
-    /// RPC V2: register this rank's namespaces and device regions.
+    /// RPC V2: register this device's namespaces and regions.
     ///
     /// Args:
-    ///     instance_id: Model instance ID, shared by every rank
-    ///     namespace_metas: One dict per namespace with keys `namespace`
-    ///         (32 bytes), `world_size`, `device_id`, `rank`, `layer_names`,
-    ///         `bytes_per_block`, `block_size`, `local_hidden`, `saver_rank`
-    ///         and optional `interleave_token`
+    ///     instance_id: Model instance ID, shared by every device
+    ///     device_id: This device's CUDA ordinal; names it in save and load
+    ///     roles: One dict per namespace with keys `namespace` (32 bytes),
+    ///         `layer_names`, `slice_bytes`, `num_groups`, `world_size`,
+    ///         `group`, `save` and optional `interleave_token`
     ///     regions: `(ipc_handle, size, name)` per whole cuMemAlloc allocation;
     ///         span `region_idx` indexes this list
     ///     transfer_backend: "kernel" (default) or "direct"
     ///
     /// Raises:
     ///     ValueError: If the server rejects the registration.
-    #[pyo3(signature = (instance_id, namespace_metas, regions, transfer_backend = "kernel"))]
+    #[pyo3(signature = (instance_id, device_id, roles, regions, transfer_backend = "kernel"))]
     fn register_context_v2(
         &self,
         py: Python<'_>,
         instance_id: String,
-        namespace_metas: Vec<Bound<'_, PyDict>>,
+        device_id: u32,
+        roles: Vec<Bound<'_, PyDict>>,
         regions: Vec<(Vec<u8>, u64, String)>,
         transfer_backend: &str,
     ) -> PyResult<()> {
         let request = RegisterContextV2 {
             instance_id,
-            namespace_meta: namespace_metas
-                .iter()
-                .map(namespace_meta)
-                .collect::<PyResult<_>>()?,
+            device_id,
+            roles: roles.iter().map(namespace_role).collect::<PyResult<_>>()?,
             regions: regions
                 .into_iter()
                 .map(|(ipc_handle, size, name)| DeviceRegion {
@@ -654,15 +654,15 @@ impl EngineRpcClient {
         .and_then(|r| check_v2_status("register_context_v2", r.status))
     }
 
-    /// RPC V2: copy objects from this rank's HBM to the server. Returns once
-    /// the copy is done; the objects seal once every saver wrote every layer.
+    /// RPC V2: copy objects from this device's HBM to the server. Returns once
+    /// the copy is done; an object seals once every group's saver wrote it.
     ///
     /// Args:
     ///     instance_id: Model instance ID
-    ///     rank: This rank; must be a saver of each object's namespace
+    ///     device_id: This device; must save each object's namespace
     ///     writes: `((namespace, prefix), region_idx, spans)` per object, where
     ///         `spans` packs `struct.pack("<QQ", offset, len)` for every layer
-    ///         in `layer_names` order
+    ///         in `layer_names` order, none crossing a layer
     ///
     /// Raises:
     ///     ValueError: If the server rejects the save.
@@ -670,12 +670,12 @@ impl EngineRpcClient {
         &self,
         py: Python<'_>,
         instance_id: String,
-        rank: u32,
+        device_id: u32,
         writes: Vec<PyObjectSpans>,
     ) -> PyResult<()> {
         let request = SaveObjectsRequest {
             instance_id,
-            rank,
+            device_id,
             writes: object_spans(writes)?,
         };
         self.call(py, "save_objects", |mut c| async move {
@@ -744,29 +744,23 @@ impl EngineRpcClient {
         Ok((resp.query_id, outcome))
     }
 
-    /// RPC V2: copy leased objects into this rank's HBM. Returns once the
+    /// RPC V2: copy leased objects into this device's HBM. Returns once the
     /// request is accepted; completion lands in the `PyLoadState`. Each lease
     /// is consumed once per call and released after `world_size` calls.
     ///
     /// Args:
     ///     instance_id: Model instance ID
-    ///     rank: This rank
-    ///     device_id: This rank's GPU; must match its registration
+    ///     device_id: This device, as registered
     ///     load_state_shm: `PyLoadState.shm_name()`
     ///     spans: Destinations, shaped like `save_objects` writes
     ///     leases: Leases from `query_object` holding every loaded key
     ///
     /// Raises:
     ///     ValueError: If the server rejects the load.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "PyO3 binding mirrors the LoadObjects request shape"
-    )]
     fn load_objects(
         &self,
         py: Python<'_>,
         instance_id: String,
-        rank: u32,
         device_id: u32,
         load_state_shm: String,
         spans: Vec<PyObjectSpans>,
@@ -774,7 +768,6 @@ impl EngineRpcClient {
     ) -> PyResult<()> {
         let request = LoadObjectsRequest {
             instance_id,
-            rank,
             device_id,
             load_state_shm,
             spans: object_spans(spans)?,

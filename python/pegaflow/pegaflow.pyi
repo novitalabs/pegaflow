@@ -255,18 +255,19 @@ class EngineRpcClient:
     def register_context_v2(
         self,
         instance_id: str,
-        namespace_metas: list[dict[str, object]],
+        device_id: int,
+        roles: list[dict[str, object]],
         regions: list[tuple[bytes, int, str]],
         transfer_backend: str = "kernel",
     ) -> None:
-        """RPC V2: register this rank's namespaces and device regions.
+        """RPC V2: register this device's namespaces and regions.
 
         Args:
-            instance_id: Model instance ID, shared by every rank.
-            namespace_metas: One dict per namespace with keys ``namespace``
-                (32 bytes), ``world_size``, ``device_id``, ``rank``,
-                ``layer_names``, ``bytes_per_block``, ``block_size``,
-                ``local_hidden``, ``saver_rank`` and optional
+            instance_id: Model instance ID, shared by every device.
+            device_id: This device's CUDA ordinal; names it in save and load.
+            roles: One dict per namespace with keys ``namespace`` (32 bytes),
+                ``layer_names``, ``slice_bytes``, ``num_groups``,
+                ``world_size``, ``group``, ``save`` and optional
                 ``interleave_token``.
             regions: ``(ipc_handle, size, name)`` per whole cuMemAlloc
                 allocation; span ``region_idx`` indexes this list.
@@ -280,20 +281,20 @@ class EngineRpcClient:
     def save_objects(
         self,
         instance_id: str,
-        rank: int,
+        device_id: int,
         writes: list[tuple[tuple[bytes, bytes], int, bytes]],
     ) -> None:
-        """RPC V2: copy objects from this rank's HBM to the server.
+        """RPC V2: copy objects from this device's HBM to the server.
 
-        Returns once the copy is done. An object seals once every saver
-        rank wrote every layer.
+        Returns once the copy is done. An object seals once every group's
+        saver wrote every layer.
 
         Args:
             instance_id: Model instance ID.
-            rank: This rank; must be a saver of each object's namespace.
+            device_id: This device; must save each object's namespace.
             writes: ``((namespace, prefix), region_idx, spans)`` per object;
                 ``spans`` packs ``struct.pack("<QQ", offset, len)`` for every
-                layer in ``layer_names`` order.
+                layer in ``layer_names`` order, none crossing a layer.
 
         Raises:
             ValueError: If the server rejects the save.
@@ -325,13 +326,12 @@ class EngineRpcClient:
     def load_objects(
         self,
         instance_id: str,
-        rank: int,
         device_id: int,
         load_state_shm: str,
         spans: list[tuple[tuple[bytes, bytes], int, bytes]],
         leases: list[bytes],
     ) -> None:
-        """RPC V2: copy leased objects into this rank's HBM.
+        """RPC V2: copy leased objects into this device's HBM.
 
         Returns once the request is accepted; completion lands in the
         ``PyLoadState``. Each lease is consumed once per call and released

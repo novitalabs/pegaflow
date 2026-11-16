@@ -9,8 +9,9 @@ Spans: vLLM 0.32 puts the whole KV cache of a rank in one allocation, layer
 ``l`` of block ``b`` at ``offset_l + b * block_stride_l``. One object (one
 block of one namespace) is one ``page_bytes`` span per layer.
 
-Savers: the ranks in ``NsSpec.savers`` save (one per slice, or one per slice
-on each CPU socket, see ``policy``).
+Roles: per namespace, this rank loads slot group ``NsSpec.roles[rank]`` and
+saves it when flagged (one group per part, or per part on each CPU socket,
+see ``policy``). The server knows the device only; ``rank`` stays here.
 
 Loads: one ``load_objects`` per step for every request it loads, as v1. With
 one vLLM cache group a failure reports the GPU blocks it was writing, as v1
@@ -97,7 +98,6 @@ class Worker:
         rpc: Any,
         instance_id: str,
         rank: int,
-        world_size: int,
         device_id: int,
         new_load_state: Callable[[], Any],
         mark_compute: Callable[[], Any],
@@ -111,13 +111,12 @@ class Worker:
         self._rpc = rpc
         self._instance_id = instance_id
         self._rank = rank
-        self._world_size = world_size
         self._device_id = device_id
         self._new_load_state = new_load_state
         self._mark_compute = mark_compute
         self._transfer_backend = transfer_backend
         self._geo: list[_NsGeometry] = []
-        self._saver_of = [rank in ns.savers for ns in layout.namespaces]
+        self._saver_of = [ns.roles[rank][1] for ns in layout.namespaces]
         # One load state per step: (state, req ids, start, GPU block ids).
         self._loads: list[tuple[Any, list[str], float, list[int]]] = []
         self._failed: set[str] = set()  # failed receives
@@ -180,8 +179,10 @@ class Worker:
                     ns.page_bytes,
                 )
             )
-            metas.append(ns.meta(self._world_size, self._rank, self._device_id))
-        self._rpc.register_context_v2(self._instance_id, metas, regions, self._transfer_backend)
+            metas.append(ns.role(self._rank))
+        self._rpc.register_context_v2(
+            self._instance_id, self._device_id, metas, regions, self._transfer_backend
+        )
         logger.info(
             "[PegaKVConnectorV2] registered instance=%s rank=%d device=%d namespaces=%d regions=%d",
             self._instance_id,
@@ -234,7 +235,6 @@ class Worker:
             state = self._new_load_state()
             self._rpc.load_objects(
                 self._instance_id,
-                self._rank,
                 self._device_id,
                 state.shm_name(),
                 self._objects(blocks),
@@ -338,7 +338,7 @@ class Worker:
                     j.ready.synchronize()
                 # As v1: time the RPC, not the wait for the forward pass.
                 start = time.perf_counter()
-                self._rpc.save_objects(self._instance_id, self._rank, writes)
+                self._rpc.save_objects(self._instance_id, self._device_id, writes)
                 ok = True
             except ValueError as e:
                 # Rejected by the server before or after its copy: a future miss.

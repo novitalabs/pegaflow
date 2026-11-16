@@ -45,7 +45,7 @@ pub use internode::{
 };
 use layout::KVCacheLayout;
 pub use lease::QueryLeaseId;
-pub use objects::{NamespaceMeta, ObjectKey, ObjectQueryStatus, ObjectSpans, Span};
+pub use objects::{NamespaceMeta, NamespaceRole, ObjectKey, ObjectQueryStatus, ObjectSpans, Span};
 pub use pegaflow_common::NumaNode;
 use pegaflow_common::{NumaTopology, group_hash};
 pub use pinned_pool::PinnedAllocation;

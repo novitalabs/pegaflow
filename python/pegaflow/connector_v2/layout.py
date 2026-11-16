@@ -36,7 +36,7 @@ class Parallel:
     pcp_size: int = 1
     dcp_size: int = 1
     # CPU socket next to each world rank's GPU, given when the policy keeps a
-    # copy per socket; empty: one copy per slice.
+    # copy per socket; empty: one copy of each part.
     sockets: tuple[int, ...] = ()
 
     @property
@@ -62,54 +62,46 @@ class NsSpec:
     hash_scale: int  # group block_size // vLLM hash_block_size
     layers: tuple[str, ...]
     namespace: bytes  # 32-byte digest
-    page_bytes: int  # one rank's bytes of one layer of one block
-    slices: int  # distinct parts one layer is split into across ranks
-    savers: tuple[int, ...]  # server ranks that save this namespace
+    page_bytes: int  # one rank's bytes of one layer of one block: one slot
+    num_groups: int  # slot groups of an object: one per (part, socket)
+    roles: tuple[tuple[int, bool], ...]  # (group, save) of each world rank
 
     def keys(self, block_hashes: Sequence[bytes]) -> list[bytes]:
         """32-byte object prefixes of this group's blocks."""
         k = self.hash_scale
         return [_digest(h) for h in block_hashes[k - 1 :: k]]
 
-    def meta(self, world_size: int, rank: int, device_id: int) -> dict[str, Any]:
-        """``NamespaceMeta`` for ``register_context_v2``."""
-        bt = self.group.block_tokens
-        # The server only uses local_hidden x block_size (one rank's slice);
-        # a padded page that does not split per token is sent as one "token".
-        block_size = bt if self.page_bytes % bt == 0 else 1
+    def role(self, rank: int) -> dict[str, Any]:
+        """``NamespaceRole`` of world rank ``rank`` for ``register_context_v2``."""
+        group, save = self.roles[rank]
         return {
             "namespace": self.namespace,
-            "world_size": world_size,
-            "device_id": device_id,
-            "rank": rank,
             "layer_names": list(self.layers),
-            "bytes_per_block": self.page_bytes * self.slices,
-            "block_size": block_size,
-            "local_hidden": self.page_bytes // block_size,
-            "saver_rank": list(self.savers),
+            "slice_bytes": self.page_bytes,
+            "num_groups": self.num_groups,
+            "world_size": len(self.roles),
+            "group": group,
+            "save": save,
         }
 
 
 @dataclass(frozen=True)
 class Layout:
     namespaces: tuple[NsSpec, ...]  # full groups first
-    # Server rank of each world rank: ranks holding one slice are
-    # consecutive, as the server's ``slice = rank * S / world_size`` needs.
-    ranks: tuple[int, ...] = (0,)
 
     @property
     def groups(self) -> list[sem.Group]:
         return [ns.group for ns in self.namespaces]
 
-    @property
-    def world_size(self) -> int:
-        return len(self.ranks)
 
-
-def _content(spec: Any, par: Parallel, gid: int) -> tuple[int, ...]:
+def _content(spec: Any, par: Parallel, gid: int, kv_heads: int | None) -> tuple[int, ...]:
     """Per world rank, which part of a layer it holds: its head shard over TP
     and, for a DCP-sharded spec, its DCP rank. Ranks with equal values hold
-    the same bytes."""
+    the same bytes. ``kv_heads``: the model's total KV heads; with fewer than
+    TP, vLLM replicates each head on ``tp // kv_heads`` adjacent ranks. Used
+    for full attention only: other attention layers (e.g. sliding windows)
+    may have their own head count, so their ranks stay distinct, which is
+    always correct at the cost of extra copies."""
     name = type(spec).__name__
     tp = par.tp_size
     if name == "MLAAttentionSpec":
@@ -117,7 +109,8 @@ def _content(spec: Any, par: Parallel, gid: int) -> tuple[int, ...]:
     elif name == "MambaSpec":
         heads = 1 if getattr(spec, "tp_replicated", False) else tp
     else:
-        heads = min(tp, getattr(spec, "max_tp_shards", None) or tp)
+        replicas = kv_heads if name == "FullAttentionSpec" else None
+        heads = min(tp, getattr(spec, "max_tp_shards", None) or replicas or tp)
     if tp % heads:
         raise Unsupported(f"group {gid}: tp_size {tp} is not a multiple of {heads} shards")
     # vLLM's default: attention specs are DCP-sharded, Mamba states are not.
@@ -129,34 +122,19 @@ def _content(spec: Any, par: Parallel, gid: int) -> tuple[int, ...]:
     )
 
 
-def _ranks(contents: Sequence[tuple[int, ...]], world: int) -> tuple[int, ...]:
-    """Server rank of each world rank. Sorting by content, coarsest namespace
-    first, makes every namespace's holders of one part consecutive whenever
-    their splits nest; otherwise raises ``Unsupported``."""
-    order = sorted(contents, key=lambda c: len(set(c)))
-    by_label = sorted(range(world), key=lambda r: (tuple(c[r] for c in order), r))
-    ranks = [0] * world
-    for label, r in enumerate(by_label):
-        ranks[r] = label
-    for c in contents:
-        n = len(set(c))
-        part_of: dict[int, int] = {}
-        for r in range(world):
-            # The server's slice of this label must name one part only.
-            if part_of.setdefault(ranks[r] * n // world, c[r]) != c[r]:
-                raise Unsupported(f"no rank order keeps every namespace's slices together: {c}")
-    return tuple(ranks)
-
-
-def _savers(
-    content: Sequence[int], ranks: Sequence[int], sockets: Sequence[int]
-) -> tuple[int, ...]:
-    """Per part, the first server rank holding it on each CPU socket, so a
-    load reads a copy on its own socket."""
-    out: dict[tuple[int, int], int] = {}
-    for r in sorted(range(len(ranks)), key=lambda r: ranks[r]):
-        out.setdefault((content[r], sockets[r]), ranks[r])
-    return tuple(sorted(out.values()))
+def _roles(content: Sequence[int], sockets: Sequence[int]) -> tuple[tuple[int, bool], ...]:
+    """``(group, save)`` of each world rank: one slot group per (part, CPU
+    socket), so a load reads a copy on its own socket; the lowest world rank
+    of each group saves it."""
+    keys = sorted({(c, s) for c, s in zip(content, sockets, strict=True)})
+    group = {k: g for g, k in enumerate(keys)}
+    seen: set[int] = set()
+    out = []
+    for c, s in zip(content, sockets, strict=True):
+        g = group[(c, s)]
+        out.append((g, g not in seen))
+        seen.add(g)
+    return tuple(out)
 
 
 # Spec fields that follow the parallel layout (heads, state and page sizes
@@ -224,8 +202,14 @@ def _kind(spec: Any, gid: int, dcp_size: int) -> sem.Group:
     raise Unsupported(f"group {gid}: no connector v2 support for {name}")
 
 
-def build_layout(kv_cache_config: Any, par: Parallel, identity: dict[str, Any]) -> Layout:
-    """Raises ``Unsupported`` for layouts connector v2 cannot store."""
+def build_layout(
+    kv_cache_config: Any,
+    par: Parallel,
+    identity: dict[str, Any],
+    kv_heads: int | None = None,
+) -> Layout:
+    """Raises ``Unsupported`` for layouts connector v2 cannot store.
+    ``kv_heads``: the model's total KV heads (``get_total_num_kv_heads``)."""
     hash_bs = getattr(kv_cache_config, "hash_block_size", None)
     gids = getattr(kv_cache_config, "prefix_cacheable_group_ids", None)
     if gids is None:
@@ -239,7 +223,7 @@ def build_layout(kv_cache_config: Any, par: Parallel, identity: dict[str, Any]) 
             continue
         groups = {_kind(s, gid, par.dcp_size) for s in specs}
         pages = {int(s.page_size_bytes) for s in specs}
-        contents = {_content(s, par, gid) for s in specs}
+        contents = {_content(s, par, gid, kv_heads) for s in specs}
         if len(groups) != 1 or len(pages) != 1 or len(contents) != 1:
             raise Unsupported(f"group {gid}: layers differ in kind, page size or rank split")
         (group,), (page,), (content,) = groups, pages, contents
@@ -248,11 +232,10 @@ def build_layout(kv_cache_config: Any, par: Parallel, identity: dict[str, Any]) 
         if bt % hbs:
             raise Unsupported(f"group {gid}: block_size {bt} is not a multiple of hash {hbs}")
         found.append((gid, kv_group, layers, group, page, content, bt // hbs))
-    ranks = _ranks([f[5] for f in found], par.world_size)
     sockets = par.sockets or (0,) * par.world_size
     out: list[NsSpec] = []
     for gid, kv_group, layers, group, page, content, hash_scale in found:
-        n_slices = len(set(content))
+        roles = _roles(content, sockets)
         # Content only: nothing here depends on TP, PCP or DCP.
         doc = {
             **identity,
@@ -270,11 +253,11 @@ def build_layout(kv_cache_config: Any, par: Parallel, identity: dict[str, Any]) 
                 layers=layers,
                 namespace=hashlib.sha256(blob).digest(),
                 page_bytes=page,
-                slices=n_slices,
-                savers=_savers(content, ranks, sockets),
+                num_groups=max(g for g, _ in roles) + 1,
+                roles=roles,
             )
         )
     out.sort(key=lambda ns: ns.group.kind != sem.FULL)
     if not out or out[0].group.kind != sem.FULL:
         raise Unsupported("connector v2 needs a full-attention group to anchor prefix queries")
-    return Layout(tuple(out), ranks)
+    return Layout(tuple(out))
