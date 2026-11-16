@@ -18,8 +18,8 @@ use crate::registry::RegistryHandle;
 use crate::session::SessionRegistry;
 use log::{debug, info, warn};
 use pegaflow_core::{
-    EngineError, LayerSave, NamespaceMeta, ObjectKey, ObjectQueryStatus, ObjectSpans, PegaEngine,
-    PrefetchStatus, QueryLeaseId, Span,
+    EngineError, LayerSave, NamespaceMeta, NamespaceRole, ObjectKey, ObjectQueryStatus,
+    ObjectSpans, PegaEngine, PrefetchStatus, QueryLeaseId, Span,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -1151,14 +1151,15 @@ impl Engine for GrpcEngineService {
         };
         let RegisterContextV2 {
             instance_id,
-            namespace_meta,
+            device_id,
+            roles,
             regions,
             client_version,
             ..
         } = req;
         let detail = format!(
-            "instance_id={instance_id} namespaces={} regions={}",
-            namespace_meta.len(),
+            "instance_id={instance_id} device_id={device_id} namespaces={} regions={}",
+            roles.len(),
             regions.len()
         );
         let result: Result<(), Status> = async {
@@ -1166,39 +1167,37 @@ impl Engine for GrpcEngineService {
             if instance_id.is_empty() {
                 return Err(Status::invalid_argument("instance_id must not be empty"));
             }
-            let first = namespace_meta
-                .first()
-                .ok_or_else(|| Status::invalid_argument("namespace_meta must not be empty"))?;
-            let (rank, device_id) = (first.rank, first.device_id);
-            if namespace_meta
-                .iter()
-                .any(|m| m.rank != rank || m.device_id != device_id)
-            {
-                return Err(Status::invalid_argument(
-                    "every namespace_meta of one request must name the same rank and device_id",
-                ));
+            if roles.is_empty() {
+                return Err(Status::invalid_argument("roles must not be empty"));
             }
             let device_id = i32::try_from(device_id)
                 .map_err(|_| Status::invalid_argument(format!("device_id {device_id}")))?;
-            let namespaces = namespace_meta
+            let namespaces = roles
                 .into_iter()
-                .map(|m| {
-                    Ok(NamespaceMeta {
-                        namespace: Self::digest(m.namespace, "namespace")?,
-                        world_size: m.world_size,
-                        layer_names: m.layer_names,
-                        bytes_per_block: m.bytes_per_block,
-                        block_size: m.block_size,
-                        local_hidden: m.local_hidden,
-                        interleave_token: m.interleave_token,
-                        saver_rank: m.saver_rank,
+                .map(|r| {
+                    let m = r
+                        .meta
+                        .ok_or_else(|| Status::invalid_argument("role without meta"))?;
+                    Ok(NamespaceRole {
+                        meta: NamespaceMeta {
+                            namespace: Self::digest(m.namespace, "namespace")?,
+                            layer_names: m.layer_names,
+                            slice_bytes: m.slice_bytes,
+                            num_groups: m.num_groups,
+                            world_size: m.world_size,
+                            interleave_token: m.interleave_token,
+                        },
+                        group: r.group,
+                        save: r.save,
                     })
                 })
                 .collect::<Result<Vec<_>, Status>>()?;
-            let regions: Vec<(Vec<u8>, u64)> =
-                regions.into_iter().map(|r| (r.ipc_handle, r.size)).collect();
+            let regions: Vec<(Vec<u8>, u64)> = regions
+                .into_iter()
+                .map(|r| (r.ipc_handle, r.size))
+                .collect();
             info!(
-                "RPC [register_context_v2]: instance_id={instance_id} rank={rank} device_id={device_id} \
+                "RPC [register_context_v2]: instance_id={instance_id} device_id={device_id} \
                  namespaces={} regions={}",
                 namespaces.len(),
                 regions.len()
@@ -1209,7 +1208,6 @@ impl Engine for GrpcEngineService {
             tokio::task::spawn_blocking(move || {
                 engine.register_context_v2(
                     &instance,
-                    rank,
                     device_id,
                     namespaces,
                     &regions,
@@ -1295,7 +1293,7 @@ impl Engine for GrpcEngineService {
         let start = Instant::now();
         let SaveObjectsRequest {
             instance_id,
-            rank,
+            device_id,
             writes,
         } = request.into_inner();
         trace_root!("rpc.save_objects", root, || {
@@ -1305,13 +1303,15 @@ impl Engine for GrpcEngineService {
             ]
         });
         let detail = format!(
-            "instance_id={instance_id} rank={rank} objects={}",
+            "instance_id={instance_id} device_id={device_id} objects={}",
             writes.len()
         );
         let fut = async {
+            let device_id = i32::try_from(device_id)
+                .map_err(|_| Status::invalid_argument(format!("device_id {device_id}")))?;
             let writes = Self::object_spans(writes)?;
             self.engine
-                .save_objects(&instance_id, rank, &writes)
+                .save_objects(&instance_id, device_id, &writes)
                 .await
                 .map_err(Self::map_engine_error)
         };
@@ -1329,7 +1329,6 @@ impl Engine for GrpcEngineService {
         let start = Instant::now();
         let LoadObjectsRequest {
             instance_id,
-            rank,
             device_id,
             load_state_shm,
             spans,
@@ -1343,7 +1342,7 @@ impl Engine for GrpcEngineService {
             ]
         });
         let detail = format!(
-            "instance_id={instance_id} rank={rank} objects={} leases={}",
+            "instance_id={instance_id} device_id={device_id} objects={} leases={}",
             spans.len(),
             lease.len()
         );
@@ -1359,14 +1358,7 @@ impl Engine for GrpcEngineService {
                 .map(|l| QueryLeaseId::from_bytes(l).map_err(Status::invalid_argument))
                 .collect::<Result<Vec<_>, _>>()?;
             self.engine
-                .load_objects(
-                    &instance_id,
-                    rank,
-                    device_id,
-                    &spans,
-                    &leases,
-                    &load_state_shm,
-                )
+                .load_objects(&instance_id, device_id, &spans, &leases, &load_state_shm)
                 .map_err(Self::map_engine_error)
         };
         let result = trace_in_span!(root, fut).await;

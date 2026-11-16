@@ -168,7 +168,7 @@ cargo run -r --bin pegaflow-metaserver
 
 - The server has two client paths: v1 KV blocks (`RegisterContextBatch`, `Save`, `Load`, `QueryPrefetch`) and RPC V2 byte-addressed objects (`RegisterContextV2`, `SaveObjects`, `LoadObjects`, `QueryObject`).
 - A deployment uses one path or the other, never both on the same server. Do not add handling for mixed v1/v2 traffic: separate metrics, SSD/prefetch budget splits, or cross-path lease checks.
-- v1 behavior must stay unchanged when touching shared code (insert worker, read cache, prefetch, SSD, RDMA); objects reuse it as ordinary sealed blocks, one slot per (saver, layer).
+- v1 behavior must stay unchanged when touching shared code (insert worker, read cache, prefetch, SSD, RDMA); objects reuse it as ordinary sealed blocks, one slot per (group, layer).
 
 ## Git Workflow
 

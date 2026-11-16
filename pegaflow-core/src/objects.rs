@@ -1,18 +1,18 @@
 //! RPC V2 objects on the block store.
 //!
 //! An object is keyed by `(namespace, prefix)`, two 32-byte digests. A
-//! namespace is one KV kind with all its layers; every rank registers the
-//! namespaces it holds and its device regions once, then saves and loads all
-//! layers of an object in one span list, `layers x L` bytes where
-//! `L = local_hidden x block_size` is one rank's slice of one layer. Each
-//! layer of the whole object (`bytes_per_block`) is `S = bytes_per_block / L`
-//! slices, and rank `r` holds slice `r x S / world_size`.
+//! namespace is one KV kind with all its layers; every device registers the
+//! namespaces it holds and its regions once, then saves and loads all layers
+//! of an object in one span list of `layers x slice_bytes` bytes. An object is
+//! `num_groups x layers` slots of `slice_bytes`; slot `layer x G + group`
+//! belongs to group `group`.
 //!
-//! Only the ranks in `saver_rank` save. The engine cuts their bytes into one
-//! slot per `(saver, layer)`, in pinned memory on the saver's NUMA node, and
-//! hands them to the insert worker like a KV save; the object seals once every
-//! slot arrived. Two savers of one slice keep two copies, and a load reads the
-//! nearest: its own NUMA node, else its own socket, else the first.
+//! Each device names, per namespace, the group it loads and whether it saves
+//! it; at most one device saves a group. A save copies the device's bytes into
+//! one slot per layer, in pinned memory on its NUMA node, and hands them to
+//! the insert worker like a KV save; the object seals once every slot arrived.
+//! A load reads its group's slots. The engine knows devices only: which bytes
+//! a group holds, and which device reads which group, is the client's choice.
 //!
 //! Sealed objects are [`SealedBlock`]s under the [`BlockKey`]
 //! `(hex(namespace), prefix)`, so they share the pinned pool, LRU eviction,
@@ -112,18 +112,26 @@ pub struct ObjectSpans {
     pub spans: Vec<Span>,
 }
 
-/// One namespace as a rank registers it; every rank of an instance
-/// registers the same.
+/// One namespace; every device of an instance registers the same.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamespaceMeta {
     pub namespace: [u8; 32],
-    pub world_size: u32,
     pub layer_names: Vec<String>,
-    pub bytes_per_block: u64,
-    pub block_size: u64,
-    pub local_hidden: u64,
+    /// Bytes of one slot: one group's part of one layer.
+    pub slice_bytes: u64,
+    pub num_groups: u32,
+    /// Loads per object; a lease is released after this many.
+    pub world_size: u32,
     pub interleave_token: u64,
-    pub saver_rank: Vec<u32>,
+}
+
+/// What one device does in one namespace: the group it loads, and whether it
+/// saves that group.
+#[derive(Debug, Clone)]
+pub struct NamespaceRole {
+    pub meta: NamespaceMeta,
+    pub group: u32,
+    pub save: bool,
 }
 
 #[derive(Debug)]
@@ -139,100 +147,57 @@ pub enum ObjectQueryStatus {
     },
 }
 
-/// The slot layout of a namespace: one slot per `(saver, layer)`.
+/// The slot layout of a namespace: one slot per `(group, layer)`.
 #[derive(Debug)]
 struct Shape {
     world_size: u32,
     layers: usize,
-    /// One rank's slice of one layer, `L`.
     slice_bytes: u64,
-    /// Slices of one layer, `S`.
-    slices: u32,
-    savers: Vec<u32>,
+    groups: u32,
 }
 
 impl Shape {
-    fn new(meta: &NamespaceMeta, rank: u32) -> Result<Self, String> {
-        let world_size = meta.world_size;
-        if world_size == 0 || rank >= world_size {
-            return Err(format!("rank {rank} is outside world_size {world_size}"));
+    fn new(meta: &NamespaceMeta) -> Result<Self, String> {
+        if meta.world_size == 0 {
+            return Err("world_size is 0".into());
         }
         if meta.layer_names.is_empty() {
             return Err("no layers".into());
         }
-        let slice_bytes = meta
-            .local_hidden
-            .checked_mul(meta.block_size)
-            .filter(|&l| l > 0)
-            .ok_or("local_hidden x block_size must be positive and fit 64 bits")?;
-        if meta.bytes_per_block == 0 || !meta.bytes_per_block.is_multiple_of(slice_bytes) {
-            return Err(format!(
-                "bytes_per_block {} is not a positive multiple of local_hidden x block_size {slice_bytes}",
-                meta.bytes_per_block
-            ));
+        if meta.slice_bytes == 0 || meta.num_groups == 0 {
+            return Err("slice_bytes and num_groups must be positive".into());
         }
-        let slices = u32::try_from(meta.bytes_per_block / slice_bytes)
-            .ok()
-            .filter(|&s| s > 0 && world_size.is_multiple_of(s))
-            .ok_or_else(|| {
-                format!(
-                    "{} slices per layer do not divide world_size {world_size}",
-                    meta.bytes_per_block / slice_bytes
-                )
-            })?;
-        let mut seen = HashSet::new();
-        if let Some(r) = meta
-            .saver_rank
-            .iter()
-            .find(|&&r| r >= world_size || !seen.insert(r))
-        {
-            return Err(format!(
-                "saver_rank {r} is repeated or outside world_size {world_size}"
-            ));
-        }
-        let shape = Self {
-            world_size,
-            layers: meta.layer_names.len(),
-            slice_bytes,
-            slices,
-            savers: meta.saver_rank.clone(),
-        };
-        let covered: HashSet<u32> = shape.savers.iter().map(|&r| shape.slice(r)).collect();
-        if covered.len() != slices as usize {
-            return Err(format!(
-                "saver_rank {:?} covers {} of {slices} slices",
-                shape.savers,
-                covered.len()
-            ));
-        }
-        Ok(shape)
-    }
-
-    fn slice(&self, rank: u32) -> u32 {
-        // u64: rank x slices may pass u32 for large worlds.
-        (u64::from(rank) * u64::from(self.slices) / u64::from(self.world_size)) as u32
+        let layers = meta.layer_names.len();
+        (layers as u64)
+            .checked_mul(meta.slice_bytes)
+            .and_then(|_| layers.checked_mul(meta.num_groups as usize))
+            .ok_or("layers x slice_bytes or layers x num_groups overflows")?;
+        Ok(Self {
+            world_size: meta.world_size,
+            layers,
+            slice_bytes: meta.slice_bytes,
+            groups: meta.num_groups,
+        })
     }
 
     fn total_slots(&self) -> usize {
-        self.savers.len() * self.layers
+        self.groups as usize * self.layers
     }
 
-    fn slot(&self, layer: usize, saver: usize) -> usize {
-        layer * self.savers.len() + saver
+    fn slot(&self, layer: usize, group: u32) -> usize {
+        layer * self.groups as usize + group as usize
     }
 
-    /// Bytes one rank saves or loads of an object.
+    /// Bytes one device saves or loads of an object.
     fn object_bytes(&self) -> u64 {
         self.layers as u64 * self.slice_bytes
     }
 
-    /// Pinned base and allocation of the slot `rank` reads in each layer of
-    /// `block`, from the copy nearest `numa`.
+    /// Pinned base and allocation of `group`'s slot in each layer of `block`.
     fn read_slots(
         &self,
-        rank: u32,
+        group: u32,
         block: &SealedBlock,
-        numa: NumaNode,
     ) -> Result<Vec<(MappedPinnedPtr, usize)>, String> {
         if block.slots().len() != self.total_slots() {
             return Err(format!(
@@ -241,28 +206,10 @@ impl Shape {
                 self.total_slots()
             ));
         }
-        let slice = self.slice(rank);
-        let copies: Vec<usize> = (0..self.savers.len())
-            .filter(|&s| self.slice(self.savers[s]) == slice)
-            .collect();
-        let socket = numa.socket();
-        let saver = copies
-            .iter()
-            .copied()
-            .min_by_key(|&s| {
-                let at = block.slot_numas()[self.slot(0, s)];
-                if at == numa {
-                    0
-                } else if socket.is_some() && at.socket() == socket {
-                    1
-                } else {
-                    2
-                }
-            })
-            .expect("registration checked that savers cover every slice");
         (0..self.layers)
             .map(|l| {
-                let raw = &block.slots()[self.slot(l, saver)];
+                let raw = &block.slots()[self.slot(l, group)];
+                // Slots may be longer: SSD padding.
                 match (
                     raw.segment_mapped_ptr(0),
                     raw.segment_allocation_id(0),
@@ -281,7 +228,7 @@ impl Shape {
     }
 }
 
-/// A run of one span inside one layer's slice.
+/// One span placed in its layer's slot.
 #[derive(Debug, PartialEq, Eq)]
 struct Piece {
     layer: usize,
@@ -290,63 +237,55 @@ struct Piece {
     len: u64,
 }
 
-/// Cut `spans`, whose lengths sum to whole slices of `slice` bytes, into
-/// pieces that never cross a layer.
-fn pieces(spans: &[Span], slice: u64) -> Vec<Piece> {
-    let mut out = Vec::with_capacity(spans.len());
-    let mut at = 0u64;
-    for s in spans {
-        let mut done = 0;
-        while done < s.len {
-            let (layer, slot_offset) = (at / slice, at % slice);
-            let len = (slice - slot_offset).min(s.len - done);
-            out.push(Piece {
-                layer: layer as usize,
-                slot_offset,
-                region_offset: s.offset + done,
-                len,
-            });
-            done += len;
-            at += len;
-        }
-    }
-    out
-}
-
-/// `o` lies inside a region of `region_size` bytes and covers every layer.
-fn check_spans(
+/// Place the spans of `o` in their layers: they lie inside a region of
+/// `region_size` bytes, none crosses a layer, and together they fill every
+/// layer.
+fn pieces(
     o: &ObjectSpans,
     region_size: Option<u64>,
     shape: &Shape,
-) -> Result<(), EngineError> {
-    let bad = |why: String| {
-        Err(EngineError::InvalidArgument(format!(
-            "object {:?}: {why}",
-            o.key
-        )))
-    };
+) -> Result<Vec<Piece>, EngineError> {
+    let bad = |why: String| EngineError::InvalidArgument(format!("object {:?}: {why}", o.key));
     let Some(size) = region_size else {
-        return bad(format!("unknown region {}", o.region));
+        return Err(bad(format!("unknown region {}", o.region)));
     };
-    let mut total = 0u64;
-    for s in &o.spans {
-        match s.offset.checked_add(s.len) {
-            Some(end) if end <= size => total = total.saturating_add(s.len),
-            _ => {
-                return bad(format!(
-                    "span {s:?} is out of region {} of {size} bytes",
-                    o.region
-                ));
-            }
+    let slice = shape.slice_bytes;
+    let mut out = Vec::with_capacity(o.spans.len());
+    let mut at = 0u64;
+    for s in o.spans.iter().filter(|s| s.len > 0) {
+        if !s.offset.checked_add(s.len).is_some_and(|end| end <= size) {
+            return Err(bad(format!(
+                "span {s:?} is out of region {} of {size} bytes",
+                o.region
+            )));
         }
+        let (layer, slot_offset) = (at / slice, at % slice);
+        if layer >= shape.layers as u64 {
+            return Err(bad(format!(
+                "spans cover more than {} layers x {slice}",
+                shape.layers
+            )));
+        }
+        if s.len > slice - slot_offset {
+            return Err(bad(format!(
+                "span {s:?} crosses layer {layer} at {slot_offset} of {slice}"
+            )));
+        }
+        out.push(Piece {
+            layer: layer as usize,
+            slot_offset,
+            region_offset: s.offset,
+            len: s.len,
+        });
+        at += s.len;
     }
-    if total != shape.object_bytes() {
-        return bad(format!(
-            "spans cover {total} bytes, expected {} layers x {}",
-            shape.layers, shape.slice_bytes
-        ));
+    if at != shape.object_bytes() {
+        return Err(bad(format!(
+            "spans cover {at} bytes, expected {} layers x {slice}",
+            shape.layers
+        )));
     }
-    Ok(())
+    Ok(out)
 }
 
 /// A device's IPC-opened regions; closed when the device and its last
@@ -381,7 +320,7 @@ enum Direction {
     Load,
 }
 
-/// A copy stream of one device and the backend the rank registered with.
+/// A copy stream of one device and the backend it registered with.
 struct Lane {
     ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
@@ -468,11 +407,18 @@ fn copy_worker(
     info!("Object {dir:?} worker shutting down: device={device_id}");
 }
 
-/// One registered rank: its regions and a save and a load worker, each
-/// pinned to the GPU's node with its own stream, so a load never queues
-/// behind a save.
+/// What a device does in one namespace.
+struct Role {
+    shape: Arc<Shape>,
+    group: u32,
+    save: bool,
+}
+
+/// One registered device: its roles, its regions and a save and a load
+/// worker, each pinned to the GPU's node with its own stream, so a load never
+/// queues behind a save.
 pub(crate) struct Device {
-    device_id: i32,
+    roles: HashMap<[u8; 32], Role>,
     regions: Arc<Regions>,
     /// The GPU's NUMA node; saves allocate there.
     numa: NumaNode,
@@ -481,6 +427,15 @@ pub(crate) struct Device {
 }
 
 impl Device {
+    fn role(&self, namespace: &[u8; 32]) -> Result<&Role, EngineError> {
+        self.roles.get(namespace).ok_or_else(|| {
+            EngineError::InvalidArgument(format!(
+                "namespace {} is not registered on this device",
+                hex(&namespace[..8])
+            ))
+        })
+    }
+
     fn region_size(&self, region: u32) -> Option<u64> {
         self.regions.list.get(region as usize).map(|r| r.1)
     }
@@ -521,11 +476,13 @@ struct Namespace {
     shape: Arc<Shape>,
 }
 
-/// The namespaces and ranks of one instance.
+/// The namespaces and devices of one instance.
 #[derive(Default)]
 pub(crate) struct ObjectInstance {
     namespaces: HashMap<[u8; 32], Namespace>,
-    devices: HashMap<u32, Arc<Device>>,
+    devices: HashMap<i32, Arc<Device>>,
+    /// The device saving each `(namespace, group)`.
+    savers: HashMap<([u8; 32], u32), i32>,
 }
 
 impl ObjectInstance {
@@ -541,26 +498,33 @@ impl ObjectInstance {
             })
     }
 
-    /// A rank of `namespaces` may join: its rank is new, and namespaces other
-    /// ranks registered match.
+    /// Device `device_id` with `roles` may join: the device is new, the
+    /// namespaces other devices registered match, and no group it saves has
+    /// a saver yet.
     fn check_join(
         &self,
-        rank: u32,
-        namespaces: &HashMap<[u8; 32], Namespace>,
+        device_id: i32,
+        roles: &HashMap<[u8; 32], (Namespace, u32, bool)>,
     ) -> Result<(), EngineError> {
-        if self.devices.contains_key(&rank) {
+        if self.devices.contains_key(&device_id) {
             return Err(EngineError::InvalidArgument(format!(
-                "rank {rank} is already registered"
+                "device {device_id} is already registered"
             )));
         }
-        for (ns, n) in namespaces {
+        for (ns, (n, group, save)) in roles {
             if self
                 .namespaces
                 .get(ns)
                 .is_some_and(|known| known.meta != n.meta)
             {
                 return Err(EngineError::InvalidArgument(format!(
-                    "namespace {} differs from what another rank registered",
+                    "namespace {} differs from what another device registered",
+                    hex(&ns[..8])
+                )));
+            }
+            if let Some(d) = self.savers.get(&(*ns, *group)).filter(|_| *save) {
+                return Err(EngineError::InvalidArgument(format!(
+                    "group {group} of namespace {} already has saver device {d}",
                     hex(&ns[..8])
                 )));
             }
@@ -591,26 +555,16 @@ impl ObjectStore {
         std::mem::take(&mut *self.instances.lock())
     }
 
-    /// Rank `rank` of `instance` and the shape of each of `keys`.
-    fn resolve<'a>(
-        &self,
-        instance: &str,
-        rank: u32,
-        keys: impl Iterator<Item = &'a ObjectKey>,
-    ) -> Result<(Arc<Device>, Vec<Arc<Shape>>), EngineError> {
+    /// Device `device_id` of `instance`.
+    fn device(&self, instance: &str, device_id: i32) -> Result<Arc<Device>, EngineError> {
         let all = self.instances.lock();
         let inst = all
             .get(instance)
             .ok_or_else(|| EngineError::InstanceMissing(instance.to_string()))?;
-        let device = inst
-            .devices
-            .get(&rank)
+        inst.devices
+            .get(&device_id)
             .cloned()
-            .ok_or_else(|| EngineError::InstanceMissing(format!("{instance} (rank {rank})")))?;
-        let shapes = keys
-            .map(|k| inst.shape(&k.namespace))
-            .collect::<Result<_, _>>()?;
-        Ok((device, shapes))
+            .ok_or_else(|| EngineError::InstanceMissing(format!("{instance} (device {device_id})")))
     }
 
     fn shape(&self, instance: &str, namespace: &[u8; 32]) -> Result<Arc<Shape>, EngineError> {
@@ -623,47 +577,41 @@ impl ObjectStore {
 }
 
 impl PegaEngine {
-    /// Register rank `rank` of `instance_id` on device `device_id` with its
-    /// `namespaces` and `regions` (IPC handle, size). A rank registers once
-    /// until its instance is unregistered or its session ends; every rank
-    /// registers the same namespaces.
+    /// Register device `device_id` of `instance_id` with its `roles` and
+    /// `regions` (IPC handle, size). A device registers once until its
+    /// instance is unregistered or its session ends.
     pub fn register_context_v2(
         &self,
         instance_id: &str,
-        rank: u32,
         device_id: i32,
-        namespaces: Vec<NamespaceMeta>,
+        roles: Vec<NamespaceRole>,
         regions: &[(Vec<u8>, u64)],
         transfer_mode: TransferMode,
     ) -> Result<(), EngineError> {
-        let mut table = HashMap::with_capacity(namespaces.len());
-        for meta in namespaces {
-            let shape = Shape::new(&meta, rank).map_err(|e| {
-                EngineError::InvalidArgument(format!(
-                    "namespace {}: {e}",
-                    hex(&meta.namespace[..8])
-                ))
-            })?;
+        let mut table = HashMap::with_capacity(roles.len());
+        for NamespaceRole { meta, group, save } in roles {
             let ns = meta.namespace;
-            if table
-                .insert(
-                    ns,
-                    Namespace {
-                        meta,
-                        shape: Arc::new(shape),
-                    },
-                )
-                .is_some()
-            {
-                return Err(EngineError::InvalidArgument(format!(
-                    "namespace {} is listed twice",
-                    hex(&ns[..8])
+            let bad = |e: String| {
+                EngineError::InvalidArgument(format!("namespace {}: {e}", hex(&ns[..8])))
+            };
+            let shape = Shape::new(&meta).map_err(bad)?;
+            if group >= shape.groups {
+                return Err(bad(format!(
+                    "group {group} is outside num_groups {}",
+                    shape.groups
                 )));
+            }
+            let n = Namespace {
+                meta,
+                shape: Arc::new(shape),
+            };
+            if table.insert(ns, (n, group, save)).is_some() {
+                return Err(bad("listed twice".into()));
             }
         }
         // Fail before opening IPC handles; checked again on insert.
         if let Some(inst) = self.objects.instances.lock().get(instance_id) {
-            inst.check_join(rank, &table)?;
+            inst.check_join(device_id, &table)?;
         }
 
         let cuda = |e: cudarc::driver::DriverError| EngineError::CudaInit(format!("{e:?}"));
@@ -704,8 +652,19 @@ impl PegaEngine {
         let load = spawn(Direction::Load, "load")?;
         let region_count = regions.list.len();
         let namespace_count = table.len();
+        let roles = table
+            .iter()
+            .map(|(ns, (n, group, save))| {
+                let role = Role {
+                    shape: Arc::clone(&n.shape),
+                    group: *group,
+                    save: *save,
+                };
+                (*ns, role)
+            })
+            .collect();
         let device = Arc::new(Device {
-            device_id,
+            roles,
             regions,
             numa,
             save,
@@ -720,15 +679,18 @@ impl PegaEngine {
                 .expect("instances write lock poisoned");
             let mut all = self.objects.instances.lock();
             let inst = all.entry(instance_id.to_string()).or_default();
-            inst.check_join(rank, &table)?;
-            inst.devices.insert(rank, device);
-            for (ns, n) in table {
+            inst.check_join(device_id, &table)?;
+            inst.devices.insert(device_id, device);
+            for (ns, (n, group, save)) in table {
+                if save {
+                    inst.savers.insert((ns, group), device_id);
+                }
                 inst.namespaces.entry(ns).or_insert(n);
             }
             self.storage.set_has_instance(true);
         }
         info!(
-            "Registered context v2: instance={instance_id} rank={rank} device={device_id} \
+            "Registered context v2: instance={instance_id} device={device_id} \
              namespaces={namespace_count} regions={region_count} numa={numa} mode={transfer_mode:?}"
         );
         Ok(())
@@ -870,36 +832,33 @@ impl PegaEngine {
         }
     }
 
-    /// Copy `writes` from rank `rank` of `instance_id` into pinned memory on
+    /// Copy `writes` from device `device_id` of `instance_id` into pinned memory on
     /// the device's NUMA node and queue them for the insert worker, as a KV
     /// save does; returns once the copies finish. Writes to objects already
-    /// cached copy nothing. An object seals once every saver wrote every
-    /// layer; unsealed objects expire with KV inflight blocks.
+    /// cached copy nothing. An object seals once every group's saver wrote
+    /// every layer; unsealed objects expire with KV inflight blocks.
     pub async fn save_objects(
         &self,
         instance_id: &str,
-        rank: u32,
+        device_id: i32,
         writes: &[ObjectSpans],
     ) -> Result<(), EngineError> {
         let start = Instant::now();
-        let (device, shapes) =
-            self.objects
-                .resolve(instance_id, rank, writes.iter().map(|w| &w.key))?;
-        let mut savers = Vec::with_capacity(writes.len());
-        for (w, shape) in writes.iter().zip(&shapes) {
-            let saver = shape
-                .savers
-                .iter()
-                .position(|&r| r == rank)
-                .ok_or_else(|| {
-                    EngineError::InvalidArgument(format!(
-                        "rank {rank} is not a saver of namespace {}",
-                        hex(&w.key.namespace[..8])
-                    ))
-                })?;
-            check_spans(w, device.region_size(w.region), shape)?;
-            savers.push(saver);
+        let device = self.objects.device(instance_id, device_id)?;
+        let mut roles = Vec::with_capacity(writes.len());
+        let mut placed = Vec::with_capacity(writes.len());
+        for w in writes {
+            let role = device.role(&w.key.namespace)?;
+            if !role.save {
+                return Err(EngineError::InvalidArgument(format!(
+                    "device {device_id} does not save namespace {}",
+                    hex(&w.key.namespace[..8])
+                )));
+            }
+            placed.push(pieces(w, device.region_size(w.region), &role.shape)?);
+            roles.push(role);
         }
+        let shapes: Vec<&Shape> = roles.iter().map(|r| &*r.shape).collect();
         let keys: Vec<BlockKey> = writes.iter().map(|w| w.key.block_key()).collect();
         let todo: Vec<usize> = self
             .storage
@@ -979,7 +938,7 @@ impl PegaEngine {
                         .1
                         .entry(*layer)
                         .or_insert_with(|| RawSaveLayer {
-                            slot_id: shape.slot(*layer, savers[i]),
+                            slot_id: shape.slot(*layer, roles[i].group),
                             padded_block_size: slot_len as usize,
                             blocks: Vec::new(),
                             block_hashes: Vec::new(),
@@ -999,9 +958,9 @@ impl PegaEngine {
         let mut bytes = 0u64;
         for &i in &todo {
             let w = &writes[i];
-            for p in pieces(&w.spans, shapes[i].slice_bytes) {
+            for p in &placed[i] {
                 let (base, alloc) = slots[&(i, p.layer)];
-                copies.push(device.copy(w.region, &p, base, alloc));
+                copies.push(device.copy(w.region, p, base, alloc));
             }
             bytes += shapes[i].object_bytes();
         }
@@ -1025,7 +984,7 @@ impl PegaEngine {
             .save_duration_seconds
             .record(start.elapsed().as_secs_f64(), &[]);
         debug!(
-            "save_objects completed: instance_id={instance_id} rank={rank} objects={} \
+            "save_objects completed: instance_id={instance_id} device={device_id} objects={} \
              bytes={padded} numa={} prep_ms={:.2} total_ms={:.2}",
             todo.len(),
             device.numa,
@@ -1043,45 +1002,37 @@ impl PegaEngine {
         Ok(())
     }
 
-    /// Copy the objects `spans` name, held by `leases`, into rank `rank` of
-    /// `instance_id`, as a KV load: returns once the request is checked and
-    /// sets the `LoadState` at `load_state_shm` when the copies finish, or
-    /// right away if checking fails. A checked request consumes each of its
-    /// leases once; one that fails consumes none.
+    /// Copy the objects `spans` name, held by `leases`, into device
+    /// `device_id` of `instance_id`, as a KV load: returns once the request is
+    /// checked and sets the `LoadState` at `load_state_shm` when the copies
+    /// finish, or right away if checking fails. A checked request consumes
+    /// each of its leases once; one that fails consumes none.
     pub fn load_objects(
         &self,
         instance_id: &str,
-        rank: u32,
         device_id: i32,
         spans: &[ObjectSpans],
         leases: &[QueryLeaseId],
         load_state_shm: &str,
     ) -> Result<(), EngineError> {
         crate::submit_with_load_state(load_state_shm, "load_objects", |done| {
-            self.submit_object_loads(instance_id, rank, device_id, spans, leases, done)
+            self.submit_object_loads(instance_id, device_id, spans, leases, done)
         })
     }
 
     fn submit_object_loads(
         &self,
         instance_id: &str,
-        rank: u32,
         device_id: i32,
         spans: &[ObjectSpans],
         leases: &[QueryLeaseId],
         done: LoadCompletion,
     ) -> Result<(), EngineError> {
-        let (device, shapes) =
-            self.objects
-                .resolve(instance_id, rank, spans.iter().map(|s| &s.key))?;
-        if device.device_id != device_id {
-            return Err(EngineError::InvalidArgument(format!(
-                "rank {rank} registered device {}, load names {device_id}",
-                device.device_id
-            )));
-        }
-        for (s, shape) in spans.iter().zip(&shapes) {
-            check_spans(s, device.region_size(s.region), shape)?;
+        let device = self.objects.device(instance_id, device_id)?;
+        let mut placed = Vec::with_capacity(spans.len());
+        for s in spans {
+            let role = device.role(&s.key.namespace)?;
+            placed.push((pieces(s, device.region_size(s.region), &role.shape)?, role));
         }
         let held = self
             .query_leases
@@ -1090,18 +1041,19 @@ impl PegaEngine {
         let mut copies = Vec::new();
         let mut objects = Vec::with_capacity(spans.len());
         let mut bytes = 0;
-        for (s, shape) in spans.iter().zip(&shapes) {
+        for (s, (list, role)) in spans.iter().zip(&placed) {
             let block = held.get(&s.key.block_key()).ok_or_else(|| {
                 EngineError::InvalidArgument(format!("no lease of this load holds {:?}", s.key))
             })?;
-            let slots = shape
-                .read_slots(rank, block, device.numa)
+            let slots = role
+                .shape
+                .read_slots(role.group, block)
                 .map_err(|e| EngineError::InvalidArgument(format!("object {:?}: {e}", s.key)))?;
-            for p in pieces(&s.spans, shape.slice_bytes) {
+            for p in list {
                 let (base, alloc) = slots[p.layer];
-                copies.push(device.copy(s.region, &p, base, alloc));
+                copies.push(device.copy(s.region, p, base, alloc));
             }
-            bytes += shape.object_bytes();
+            bytes += role.shape.object_bytes();
             objects.push(Arc::clone(block));
         }
         device.submit(
@@ -1161,95 +1113,50 @@ fn mapped_size(ptr: sys::CUdeviceptr) -> Result<u64, String> {
 mod tests {
     use super::*;
 
-    fn meta(
-        world_size: u32,
-        bytes_per_block: u64,
-        local_hidden: u64,
-        savers: &[u32],
-    ) -> NamespaceMeta {
+    fn meta(slice_bytes: u64, num_groups: u32) -> NamespaceMeta {
         NamespaceMeta {
             namespace: [7; 32],
-            world_size,
             layer_names: vec!["l0".into(), "l1".into()],
-            bytes_per_block,
-            block_size: 64,
-            local_hidden,
+            slice_bytes,
+            num_groups,
+            world_size: 4,
             interleave_token: 0,
-            saver_rank: savers.to_vec(),
         }
     }
 
     #[test]
-    fn shapes_map_ranks_to_slices() {
-        // GQA, 4 heads over TP4: 4 slices, one per rank.
-        let gqa = Shape::new(&meta(4, 65536, 256, &[0, 1, 2, 3]), 2).unwrap();
-        assert_eq!((gqa.slices, gqa.slice_bytes), (4, 16384));
+    fn shapes_place_groups_per_layer() {
+        let gqa = Shape::new(&meta(16384, 4)).unwrap();
         assert_eq!(
-            (0..4).map(|r| gqa.slice(r)).collect::<Vec<_>>(),
-            [0, 1, 2, 3]
+            (gqa.total_slots(), gqa.slot(1, 2), gqa.object_bytes()),
+            (8, 6, 32768)
         );
-        assert_eq!((gqa.total_slots(), gqa.slot(1, 2)), (8, 6));
-        // MLA over TP8: one replicated slice, two savers keep two copies.
-        let mla = Shape::new(&meta(8, 36864, 576, &[0, 4]), 7).unwrap();
-        assert_eq!((mla.slices, mla.slice(7), mla.total_slots()), (1, 0, 4));
-        // GQA, 2 heads over TP4: ranks pair up on a slice.
-        let pairs = Shape::new(&meta(4, 32768, 256, &[0, 2]), 1).unwrap();
-        assert_eq!(
-            (0..4).map(|r| pairs.slice(r)).collect::<Vec<_>>(),
-            [0, 0, 1, 1]
-        );
-
-        for (case, m, rank) in [
-            ("rank past world", meta(4, 65536, 256, &[0, 1, 2, 3]), 4),
-            ("ragged slice", meta(4, 65536 + 1, 256, &[0, 1, 2, 3]), 0),
+        for (case, m) in [
+            ("zero slice", meta(0, 4)),
+            ("zero groups", meta(16384, 0)),
             (
-                "slices do not divide world",
-                meta(4, 3 * 16384, 256, &[0, 1, 2]),
-                0,
+                "no layers",
+                NamespaceMeta {
+                    layer_names: vec![],
+                    ..meta(16384, 4)
+                },
             ),
-            ("uncovered slice", meta(4, 65536, 256, &[0, 1, 2]), 0),
-            ("repeated saver", meta(8, 36864, 576, &[0, 0]), 0),
-            ("saver past world", meta(8, 36864, 576, &[8]), 0),
-            ("zero hidden", meta(8, 36864, 0, &[0]), 0),
+            (
+                "zero world",
+                NamespaceMeta {
+                    world_size: 0,
+                    ..meta(16384, 4)
+                },
+            ),
         ] {
-            assert!(Shape::new(&m, rank).is_err(), "{case}");
+            assert!(Shape::new(&m).is_err(), "{case}");
         }
     }
 
     #[test]
-    fn spans_cut_at_layer_boundaries() {
+    fn spans_fill_layers_without_crossing() {
+        let shape = Shape::new(&meta(16, 4)).unwrap();
         let span = |offset, len| Span { offset, len };
-        let piece = |layer, slot_offset, region_offset, len| Piece {
-            layer,
-            slot_offset,
-            region_offset,
-            len,
-        };
-        // Layer-first K then V: two spans per layer of 8 bytes each.
-        assert_eq!(
-            pieces(&[span(0, 8), span(100, 8), span(16, 8), span(116, 8)], 16),
-            [
-                piece(0, 0, 0, 8),
-                piece(0, 8, 100, 8),
-                piece(1, 0, 16, 8),
-                piece(1, 8, 116, 8)
-            ]
-        );
-        // One span over both layers splits in two.
-        assert_eq!(
-            pieces(&[span(40, 32)], 16),
-            [piece(0, 0, 40, 16), piece(1, 0, 56, 16)]
-        );
-        // A span that crosses a layer mid-way.
-        assert_eq!(
-            pieces(&[span(0, 12), span(50, 20)], 16),
-            [piece(0, 0, 0, 12), piece(0, 12, 50, 4), piece(1, 0, 54, 16)]
-        );
-    }
-
-    #[test]
-    fn spans_are_checked_against_region_and_layers() {
-        let shape = Shape::new(&meta(4, 65536, 256, &[0, 1, 2, 3]), 0).unwrap();
         let obj = |spans: Vec<Span>| ObjectSpans {
             key: ObjectKey {
                 namespace: [7; 32],
@@ -1258,21 +1165,54 @@ mod tests {
             region: 0,
             spans,
         };
-        let span = |offset, len| Span { offset, len };
-        let whole = 2 * 16384;
-        assert!(check_spans(&obj(vec![span(0, whole)]), Some(whole), &shape).is_ok());
+        let piece = |layer, slot_offset, region_offset, len| Piece {
+            layer,
+            slot_offset,
+            region_offset,
+            len,
+        };
+        // Layer-first K then V: two spans per layer of 8 bytes each.
+        assert_eq!(
+            pieces(
+                &obj(vec![span(0, 8), span(100, 8), span(16, 8), span(116, 8)]),
+                Some(200),
+                &shape
+            )
+            .unwrap(),
+            [
+                piece(0, 0, 0, 8),
+                piece(0, 8, 100, 8),
+                piece(1, 0, 16, 8),
+                piece(1, 8, 116, 8)
+            ]
+        );
+        assert!(pieces(&obj(vec![span(0, 16), span(16, 16)]), Some(32), &shape).is_ok());
         for (case, o, size) in [
-            ("unknown region", obj(vec![span(0, whole)]), None),
-            ("past the region", obj(vec![span(1, whole)]), Some(whole)),
+            ("unknown region", obj(vec![span(0, 16), span(16, 16)]), None),
+            (
+                "past the region",
+                obj(vec![span(1, 16), span(17, 16)]),
+                Some(32),
+            ),
             (
                 "overflow",
-                obj(vec![span(u64::MAX, 2), span(0, whole - 2)]),
-                Some(whole),
+                obj(vec![span(u64::MAX, 2), span(0, 14), span(0, 16)]),
+                Some(32),
             ),
-            ("short", obj(vec![span(0, whole - 1)]), Some(whole)),
-            ("long", obj(vec![span(0, whole), span(0, 1)]), Some(whole)),
+            ("crosses a layer", obj(vec![span(0, 32)]), Some(32)),
+            (
+                "crosses mid-layer",
+                obj(vec![span(0, 12), span(12, 20)]),
+                Some(32),
+            ),
+            ("short", obj(vec![span(0, 16), span(16, 15)]), Some(32)),
+            (
+                "long",
+                obj(vec![span(0, 16), span(16, 16), span(0, 1)]),
+                Some(32),
+            ),
         ] {
-            assert!(check_spans(&o, size, &shape).is_err(), "{case}");
+            assert!(pieces(&o, size, &shape).is_err(), "{case}");
         }
     }
 

@@ -6,7 +6,7 @@ No vLLM, torch, native extension or server: the server is a fake.
 from __future__ import annotations
 
 import struct
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import pytest
 
@@ -66,6 +66,11 @@ class MLAAttentionSpec(_Spec):
 
 
 @dataclass
+class MambaSpec(_Spec):
+    mamba_cache_mode: str = "align"
+
+
+@dataclass
 class SlidingWindowSpec(_Spec):
     sliding_window: int = 8
 
@@ -94,25 +99,83 @@ def test_layout_orders_full_first_and_splits_heads():
     full, win = layout.namespaces
     assert (full.gid, full.group, win.group) == (1, FULL4, WIN)
     # Two head shards over TP4: ranks 0,1 hold shard 0; 2,3 shard 1.
-    assert full.savers == (0, 2)
-    meta = full.meta(world_size=4, rank=3, device_id=7)
-    assert meta["bytes_per_block"] == 2048 and meta["local_hidden"] * meta["block_size"] == 1024
+    assert full.roles == ((0, True), (0, False), (1, True), (1, False))
+    role = full.role(3)
+    assert (role["slice_bytes"], role["num_groups"], role["world_size"]) == (1024, 2, 4)
+    assert (role["group"], role["save"]) == (1, False)
     assert len(full.namespace) == 32 and full.namespace != win.namespace
 
 
+def _r(*groups: int) -> tuple[tuple[int, bool], ...]:
+    """Roles from each rank's group: the first rank of a group saves it."""
+    return tuple((g, g not in groups[:i]) for i, g in enumerate(groups))
+
+
 @pytest.mark.parametrize(
-    "sockets,savers",
+    "spec,par,kv_heads,roles",
     [
-        pytest.param((0, 0, 1, 1), (0, 2), id="replicas-on-one-socket"),
-        pytest.param((0, 1, 0, 1), (0, 1, 2, 3), id="replicas-across-sockets"),
+        pytest.param(FullAttentionSpec(4, 1024), Parallel(4), 8, _r(0, 1, 2, 3), id="gqa-tp4"),
+        # 4 KV heads over TP8: vLLM replicates each head on 2 adjacent ranks.
+        pytest.param(
+            FullAttentionSpec(4, 512), Parallel(8), 4, _r(0, 0, 1, 1, 2, 2, 3, 3), id="gqa-replicated"
+        ),
+        pytest.param(MLAAttentionSpec(4, 576), Parallel(8), None, _r(*[0] * 8), id="mla-one-copy"),
+        pytest.param(
+            MLAAttentionSpec(4, 576),
+            Parallel(8, sockets=(0, 0, 0, 0, 1, 1, 1, 1)),
+            None,
+            _r(0, 0, 0, 0, 1, 1, 1, 1),
+            id="mla-copy-per-socket",
+        ),
+        pytest.param(
+            FullAttentionSpec(4, 1024, max_tp_shards=2),
+            Parallel(4, sockets=(0, 1, 0, 1)),
+            None,
+            _r(0, 1, 2, 3),
+            id="replicas-across-sockets",
+        ),
+        # PCP replicates the cache.
+        pytest.param(MLAAttentionSpec(4, 576), Parallel(2, 2), None, _r(0, 0, 0, 0), id="pcp"),
+        # DCP over the PCP axis: the DCP rank is the PCP rank.
+        pytest.param(MLAAttentionSpec(4, 576), Parallel(2, 2, 2), None, _r(0, 0, 1, 1), id="dcp=pcp"),
+        # DCP over TP x PCP spans PCP first: world ranks 1, 2 swap DCP ranks.
+        pytest.param(
+            MLAAttentionSpec(4, 576), Parallel(2, 2, 4), None, _r(0, 2, 1, 3), id="dcp=tp*pcp"
+        ),
+        # Two head shards x DCP2 over TP4: every rank holds a distinct part.
+        pytest.param(
+            FullAttentionSpec(4, 512, max_tp_shards=2),
+            Parallel(4, 1, 2),
+            None,
+            _r(0, 1, 2, 3),
+            id="gqa-dcp",
+        ),
     ],
 )
-def test_layout_saves_each_shard_once_per_socket(sockets, savers):
-    cfg = _Config([_Group(["f0"], FullAttentionSpec(4, 1024, max_tp_shards=2))])
-    (ns,) = build_layout(cfg, Parallel(4, sockets=sockets), {}).namespaces
-    assert ns.savers == savers
-    (one,) = build_layout(cfg, Parallel(4), {}).namespaces
+def test_layout_assigns_slot_groups(spec, par, kv_heads, roles):
+    layout = build_layout(_Config([_Group(["l0"], spec)]), par, {}, kv_heads)
+    (ns,) = layout.namespaces
+    # One vLLM block spans block_size tokens on each DCP rank.
+    assert ns.group == sem.Group(sem.FULL, 4 * par.dcp_size)
+    assert (ns.roles, ns.num_groups) == (roles, len({g for g, _ in roles}))
+    assert layout.world_size == par.world_size
+    # Sockets choose copies, not the namespace.
+    plain = replace(par, sockets=())
+    (one,) = build_layout(_Config([_Group(["l0"], spec)]), plain, {}, kv_heads).namespaces
     assert ns.namespace == one.namespace
+
+
+def test_namespaces_assign_groups_independently():
+    """TP2 x PCP2 x DCP2: MLA splits by DCP rank, Mamba by TP rank."""
+    cfg = _Config(
+        [
+            _Group(["f0"], MLAAttentionSpec(4, 576)),
+            _Group(["m0"], MambaSpec(4, 4096)),
+        ]
+    )
+    mla, mamba = build_layout(cfg, Parallel(2, 2, 2), {}).namespaces
+    assert mla.roles == _r(0, 0, 1, 1)
+    assert mamba.roles == _r(0, 1, 0, 1)
 
 
 @pytest.mark.parametrize(
@@ -138,43 +201,6 @@ def test_namespace_ignores_the_parallel_layout(spec, par, same):
         else MLAAttentionSpec(8, 576)
     )
     assert (ns(spec, par).namespace == ns(ref_spec, Parallel(2)).namespace) is same
-
-
-@pytest.mark.parametrize(
-    "spec,par,ranks,slices,savers",
-    [
-        # PCP replicates the cache: one slice, world ranks keep their order.
-        pytest.param(MLAAttentionSpec(4, 576), Parallel(2, 2), (0, 1, 2, 3), 1, (0,), id="pcp"),
-        # DCP over the PCP axis: the DCP rank is the PCP rank.
-        pytest.param(
-            MLAAttentionSpec(4, 576), Parallel(2, 2, 2), (0, 1, 2, 3), 2, (0, 2), id="dcp=pcp"
-        ),
-        # DCP over TP x PCP spans PCP first: server ranks reorder world ranks 1, 2.
-        pytest.param(
-            MLAAttentionSpec(4, 576),
-            Parallel(2, 2, 4),
-            (0, 2, 1, 3),
-            4,
-            (0, 1, 2, 3),
-            id="dcp=tp*pcp",
-        ),
-        # Two head shards x DCP2 over TP4: every rank holds a distinct part.
-        pytest.param(
-            FullAttentionSpec(4, 512, max_tp_shards=2),
-            Parallel(4, 1, 2),
-            (0, 1, 2, 3),
-            4,
-            (0, 1, 2, 3),
-            id="gqa-dcp",
-        ),
-    ],
-)
-def test_layout_maps_dcp_and_pcp_ranks(spec, par, ranks, slices, savers):
-    layout = build_layout(_Config([_Group(["l0"], spec)]), par, {})
-    (ns,) = layout.namespaces
-    # One vLLM block spans block_size tokens on each DCP rank.
-    assert ns.group == sem.Group(sem.FULL, 4 * par.dcp_size)
-    assert (layout.ranks, ns.slices, ns.savers) == (ranks, slices, savers)
 
 
 @pytest.mark.parametrize(
@@ -259,7 +285,7 @@ class Req:
 
 
 def _ns(gid: int, group: sem.Group, tag: bytes) -> NsSpec:
-    return NsSpec(gid, group, 1, ("l",), tag * 32, 64, 1, (0,))
+    return NsSpec(gid, group, 1, ("l",), tag * 32, 64, 1, ((0, True),))
 
 
 def _hashes(n: int) -> list[bytes]:
@@ -462,13 +488,13 @@ class _Rpc:
         self.saved = []
         self.loaded = []
 
-    def register_context_v2(self, instance_id, metas, regions, backend):
-        self.registered = (metas, regions, backend)
+    def register_context_v2(self, instance_id, device_id, roles, regions, backend):
+        self.registered = (device_id, roles, regions, backend)
 
-    def save_objects(self, instance_id, rank, writes):
+    def save_objects(self, instance_id, device_id, writes):
         self.saved.append(writes)
 
-    def load_objects(self, instance_id, rank, device_id, shm, objects, leases):
+    def load_objects(self, instance_id, device_id, shm, objects, leases):
         self.loaded.append((len(objects), sorted(leases)))
 
 
@@ -478,13 +504,14 @@ class _Ready:
 
 
 def test_worker_registers_one_region_and_packs_spans():
-    layout = Layout((NsSpec(0, FULL4, 1, ("a", "b"), b"N" * 32, 64, 1, (0,)),))
+    layout = Layout((NsSpec(0, FULL4, 1, ("a", "b"), b"N" * 32, 64, 1, ((0, True),)),))
     rpc = _Rpc()
-    w = Worker(layout, rpc, "inst", 0, 1, 3, object, _Ready)
+    w = Worker(layout, rpc, "inst", 0, 3, object, _Ready)
     regions = {"a": Region(b"h" * 64, 10_000, 100), "b": Region(b"h" * 64, 10_000, 5_000)}
     w.register({"a": "A", "b": "B"}, {"a": 64, "b": 128}, lambda t: regions[t.lower()])
-    metas, regs, backend = rpc.registered
-    assert len(regs) == 1 and backend == "direct" and metas[0]["rank"] == 0
+    device, roles, regs, backend = rpc.registered
+    assert (device, len(regs), backend) == (3, 1, "direct")
+    assert (roles[0]["group"], roles[0]["save"], roles[0]["slice_bytes"]) == (0, True, 64)
     # Two requests of one step computed the same block: one write.
     w.save(type("P", (), {"saves": [(0, b"k" * 32, 2), (0, b"k" * 32, 2)], "step": 0})())
     w.shutdown()
@@ -510,10 +537,10 @@ class _State:
 
 
 def test_worker_loads_a_step_in_one_rpc_and_fails_it_as_a_whole():
-    layout = Layout((NsSpec(0, FULL4, 1, ("a",), b"N" * 32, 64, 1, (0,)),))
+    layout = Layout((NsSpec(0, FULL4, 1, ("a",), b"N" * 32, 64, 1, ((0, True),)),))
     rpc = _Rpc()
     states = [_State(1), _State(-1)]
-    w = Worker(layout, rpc, "inst", 0, 1, 0, lambda: states.pop(0), _Ready)
+    w = Worker(layout, rpc, "inst", 0, 0, lambda: states.pop(0), _Ready)
     w.register({"a": "A"}, {"a": 64}, lambda t: Region(b"h" * 64, 10_000, 0))
     step = StepPlan(
         loads=[
@@ -541,8 +568,8 @@ def test_worker_loads_a_step_in_one_rpc_and_fails_it_as_a_whole():
 
 
 def test_worker_reports_failed_loads_by_block_with_one_group():
-    layout = Layout((NsSpec(0, FULL4, 1, ("a",), b"N" * 32, 64, 1, (0,)),))
-    w = Worker(layout, _Rpc(), "inst", 0, 1, 0, lambda: _State(-1), _Ready, block_errors=True)
+    layout = Layout((NsSpec(0, FULL4, 1, ("a",), b"N" * 32, 64, 1, ((0, True),)),))
+    w = Worker(layout, _Rpc(), "inst", 0, 0, lambda: _State(-1), _Ready, block_errors=True)
     w.register({"a": "A"}, {"a": 64}, lambda t: Region(b"h" * 64, 10_000, 0))
     w.start(
         StepPlan(

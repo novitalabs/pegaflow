@@ -254,12 +254,15 @@ message ReleaseTransferLockResponse {
 //
 // An object is keyed by (namespace, prefix), two 32-byte digests the client
 // computes. A namespace is one KV kind with all its layers; the server only
-// compares its bytes and never branches on what it describes. Each rank
+// compares its bytes and never branches on what it describes. Each device
 // registers its namespaces and device regions once, then saves and loads the
-// bytes of every layer of an object in one span list. The server cuts those
-// bytes into one slot per (saver rank, layer), seals the object once every
-// slot arrived, and stores it as a KV block, sharing the pinned pool, LRU,
-// SSD cache, RDMA fetch and MetaServer with v1.
+// bytes of every layer of an object in one span list. An object of a
+// namespace is num_groups x layers slots of slice_bytes; slot
+// layer x num_groups + group belongs to group `group`. Each device names, per
+// namespace, the group it reads and whether it writes it. The server seals an
+// object once every slot arrived and stores it as a KV block, sharing the
+// pinned pool, LRU, SSD cache, RDMA fetch and MetaServer with v1. The server
+// knows devices only; how they map to the client's ranks is the client's.
 
 message DeviceRegion {
   // CUipcMemHandle of a whole cuMemAlloc allocation (64 bytes).
@@ -270,41 +273,44 @@ message DeviceRegion {
   string name = 3;
 }
 
+// One namespace; byte-identical on every device of an instance.
 message NamespaceMeta {
   // 32-byte digest identifying this namespace; equals ObjectKey.namespace of
   // every object saved, queried or loaded under it.
   bytes namespace = 1;
-  uint32 world_size = 2;
-  // Caller's device and rank; the same in every NamespaceMeta of one request.
-  uint32 device_id = 3;
-  uint32 rank = 4;
   // Layers of this namespace, in the order spans list them.
-  repeated string layer_names = 5;
-  // Bytes of one layer of the whole object (one block, full hidden width,
-  // K and V together) as stored on the server. Not the per-rank slice and
-  // not multiplied by replicas.
-  uint64 bytes_per_block = 6;
-  // Tokens per block, e.g. 64.
-  uint64 block_size = 7;
-  // Bytes one rank holds per token in one layer (K and V together).
-  // bytes_per_block / (local_hidden * block_size) is the number of slices
-  // one layer is split into: 1 means every rank holds a full replica.
-  uint64 local_hidden = 8;
+  repeated string layer_names = 2;
+  // Bytes of one slot: one group's part of one layer of one object.
+  uint64 slice_bytes = 3;
+  // Slot groups of an object, G.
+  uint32 num_groups = 4;
+  // Devices that load each object; a lease is released after this many loads.
+  uint32 world_size = 5;
   // For DCP. Stored as given; not read by this version.
-  uint64 interleave_token = 9;
-  // Ranks that write this namespace, e.g. [0, 4] for MLA over two NUMA nodes.
-  repeated uint32 saver_rank = 10;
+  uint64 interleave_token = 6;
+}
+
+// What one device does in one namespace.
+message NamespaceRole {
+  NamespaceMeta meta = 1;
+  // Slot group this device loads, and saves when `save` is set; < num_groups.
+  uint32 group = 2;
+  // At most one device of an instance saves each group.
+  bool save = 3;
 }
 
 message RegisterContextV2 {
   string instance_id = 1;
-  repeated NamespaceMeta namespace_meta = 2;
+  // CUDA device of the caller; names it in Save and Load. Registered once per
+  // instance.
+  uint32 device_id = 2;
+  repeated NamespaceRole roles = 3;
   // One registration may carry several regions. ObjectSpans.region_idx in
   // Save / Load is the index into this list, in registration order.
-  repeated DeviceRegion regions = 3;
-  string client_version = 4;
-  // H2D/D2H transfer backend the client chose for this rank's copies.
-  TransferMode transfer_mode = 5;
+  repeated DeviceRegion regions = 4;
+  string client_version = 5;
+  // H2D/D2H transfer backend the client chose for this device's copies.
+  TransferMode transfer_mode = 6;
 }
 
 message RegisterContextV2Response {
@@ -324,16 +330,18 @@ message ObjectSpans {
   ObjectKey key = 1;
   uint32 region_idx = 2;  // index into RegisterContextV2.regions, registration order
   // [offset, len, offset, len, ...] covering every layer of the namespace in
-  // layer_names order; within one layer, in the client's own order (e.g. K
-  // then V under layer-first). Save and Load of the same key list them in the
-  // same order. Each element is exactly 16 bytes: offset u64 LE, len u64 LE,
-  // offset counted from the start of the region's allocation.
+  // layer_names order, slice_bytes per layer; no span crosses a layer. Within
+  // one layer, in the client's own order (e.g. K then V under layer-first).
+  // Save and Load of the same key list them in the same order. Each element
+  // is exactly 16 bytes: offset u64 LE, len u64 LE, offset counted from the
+  // start of the region's allocation.
   repeated bytes span = 3;
 }
 
 message SaveObjectsRequest {
   string instance_id = 1;
-  uint32 rank = 2;
+  // A device that saves every namespace it writes here.
+  uint32 device_id = 2;
   repeated ObjectSpans writes = 3;
 }
 
@@ -365,16 +373,14 @@ message QueryObjectResponse {
 
 message LoadObjectsRequest {
   string instance_id = 1;
-  uint32 rank = 2;
-  // Must equal the device_id this rank registered.
-  uint32 device_id = 3;
+  uint32 device_id = 2;
   // A LoadState the server sets once the copies finish or fail; the reply
   // comes as soon as the request is checked.
-  string load_state_shm = 4;
-  repeated ObjectSpans spans = 5;
+  string load_state_shm = 3;
+  repeated ObjectSpans spans = 4;
   // Each lease is consumed once by this request and released after
   // world_size consumes.
-  repeated bytes lease = 6;
+  repeated bytes lease = 5;
 }
 
 message LoadObjectsResponse {
