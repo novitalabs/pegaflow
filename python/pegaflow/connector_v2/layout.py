@@ -88,7 +88,6 @@ class NsSpec:
 @dataclass(frozen=True)
 class Layout:
     namespaces: tuple[NsSpec, ...]  # full groups first
-    world_size: int = 1
 
     @property
     def groups(self) -> list[sem.Group]:
@@ -99,7 +98,10 @@ def _content(spec: Any, par: Parallel, gid: int, kv_heads: int | None) -> tuple[
     """Per world rank, which part of a layer it holds: its head shard over TP
     and, for a DCP-sharded spec, its DCP rank. Ranks with equal values hold
     the same bytes. ``kv_heads``: the model's total KV heads; with fewer than
-    TP, vLLM replicates each head on ``tp // kv_heads`` adjacent ranks."""
+    TP, vLLM replicates each head on ``tp // kv_heads`` adjacent ranks. Used
+    for full attention only: other attention layers (e.g. sliding windows)
+    may have their own head count, so their ranks stay distinct, which is
+    always correct at the cost of extra copies."""
     name = type(spec).__name__
     tp = par.tp_size
     if name == "MLAAttentionSpec":
@@ -107,7 +109,8 @@ def _content(spec: Any, par: Parallel, gid: int, kv_heads: int | None) -> tuple[
     elif name == "MambaSpec":
         heads = 1 if getattr(spec, "tp_replicated", False) else tp
     else:
-        heads = min(tp, getattr(spec, "max_tp_shards", None) or kv_heads or tp)
+        replicas = kv_heads if name == "FullAttentionSpec" else None
+        heads = min(tp, getattr(spec, "max_tp_shards", None) or replicas or tp)
     if tp % heads:
         raise Unsupported(f"group {gid}: tp_size {tp} is not a multiple of {heads} shards")
     # vLLM's default: attention specs are DCP-sharded, Mamba states are not.
@@ -257,4 +260,4 @@ def build_layout(
     out.sort(key=lambda ns: ns.group.kind != sem.FULL)
     if not out or out[0].group.kind != sem.FULL:
         raise Unsupported("connector v2 needs a full-attention group to anchor prefix queries")
-    return Layout(tuple(out), par.world_size)
+    return Layout(tuple(out))

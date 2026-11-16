@@ -103,7 +103,7 @@ impl Span {
     }
 }
 
-/// Where one object sits in a rank's region: spans over every layer of its
+/// Where one object sits in a device's region: spans over every layer of its
 /// namespace, in `layer_names` order.
 #[derive(Debug, Clone)]
 pub struct ObjectSpans {

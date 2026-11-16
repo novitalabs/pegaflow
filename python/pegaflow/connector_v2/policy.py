@@ -1,7 +1,7 @@
 """Choices inside what the semantics allow, made once per model.
 
 - Copies: a pure-attention model (full and MLA groups only) keeps one copy
-  per slice, as v1 does. A hybrid model (any window or checkpoint group)
+  of each part, as v1 does. A hybrid model (any window or checkpoint group)
   keeps one per CPU socket, so a load reads a copy on its own socket.
 - Transfer backend: as v1 ``resolve_transfer_backend``, the kernel for MLA
   models (many small slots, one launch beats one copy per slot) and direct

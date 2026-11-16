@@ -26,8 +26,8 @@ Each device registers, per namespace, the `group` it loads and whether it saves 
 |---|---|---|---|
 | GQA, 8 KV heads over TP4 | 4 | one page of 2 heads | `(0,✓) (1,✓) (2,✓) (3,✓)` |
 | GQA, 4 KV heads over TP8 (heads replicated on 2 ranks) | 4 | one page of 1 head | `(0,✓) (0) (1,✓) (1) (2,✓) (2) (3,✓) (3)` |
-| MLA over TP8, one copy | 1 | one page | all group 0, device 0 saves |
-| MLA over TP8, one copy per socket | 2 | one page | groups `0,0,0,0,1,1,1,1`, devices 0 and 4 save |
+| MLA over TP8, one copy | 1 | one page | all group 0, world rank 0 saves |
+| MLA over TP8, one copy per socket | 2 | one page | groups `0,0,0,0,1,1,1,1`, world ranks 0 and 4 save |
 
 An object seals, becoming visible to queries, SSD and the MetaServer, once every group's saver has written every layer. Each slot sits on its saver's NUMA node. A group without a saver is a client bug: its objects never seal and expire with unsealed KV blocks.
 

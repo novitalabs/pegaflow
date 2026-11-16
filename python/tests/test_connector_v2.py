@@ -117,7 +117,11 @@ def _r(*groups: int) -> tuple[tuple[int, bool], ...]:
         pytest.param(FullAttentionSpec(4, 1024), Parallel(4), 8, _r(0, 1, 2, 3), id="gqa-tp4"),
         # 4 KV heads over TP8: vLLM replicates each head on 2 adjacent ranks.
         pytest.param(
-            FullAttentionSpec(4, 512), Parallel(8), 4, _r(0, 0, 1, 1, 2, 2, 3, 3), id="gqa-replicated"
+            FullAttentionSpec(4, 512),
+            Parallel(8),
+            4,
+            _r(0, 0, 1, 1, 2, 2, 3, 3),
+            id="gqa-replicated",
         ),
         pytest.param(MLAAttentionSpec(4, 576), Parallel(8), None, _r(*[0] * 8), id="mla-one-copy"),
         pytest.param(
@@ -137,7 +141,9 @@ def _r(*groups: int) -> tuple[tuple[int, bool], ...]:
         # PCP replicates the cache.
         pytest.param(MLAAttentionSpec(4, 576), Parallel(2, 2), None, _r(0, 0, 0, 0), id="pcp"),
         # DCP over the PCP axis: the DCP rank is the PCP rank.
-        pytest.param(MLAAttentionSpec(4, 576), Parallel(2, 2, 2), None, _r(0, 0, 1, 1), id="dcp=pcp"),
+        pytest.param(
+            MLAAttentionSpec(4, 576), Parallel(2, 2, 2), None, _r(0, 0, 1, 1), id="dcp=pcp"
+        ),
         # DCP over TP x PCP spans PCP first: world ranks 1, 2 swap DCP ranks.
         pytest.param(
             MLAAttentionSpec(4, 576), Parallel(2, 2, 4), None, _r(0, 2, 1, 3), id="dcp=tp*pcp"
@@ -158,7 +164,6 @@ def test_layout_assigns_slot_groups(spec, par, kv_heads, roles):
     # One vLLM block spans block_size tokens on each DCP rank.
     assert ns.group == sem.Group(sem.FULL, 4 * par.dcp_size)
     assert (ns.roles, ns.num_groups) == (roles, len({g for g, _ in roles}))
-    assert layout.world_size == par.world_size
     # Sockets choose copies, not the namespace.
     plain = replace(par, sockets=())
     (one,) = build_layout(_Config([_Group(["l0"], spec)]), plain, {}, kv_heads).namespaces
