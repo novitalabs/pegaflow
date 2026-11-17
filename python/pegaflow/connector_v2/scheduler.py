@@ -148,7 +148,9 @@ class Scheduler:
         self._steps = 0
         self._pin: Callable[[list[int]], Any] | None = None
         self._unpin: Callable[[Any], None] | None = None
-        self._pins: dict[int, Any] = {}  # plan step -> pin token
+        self._pins: dict[int, tuple[Any, int]] = {}  # plan step -> (pin token, blocks)
+        self._pinned_blocks = 0
+        self._reported_pinned: int | None = None
         self._has_checkpoint = any(ns.group.kind == sem.CHECKPOINT for ns in layout.namespaces)
         self._prefetching: dict[str, float] = {}  # req id -> first Loading answer
         self._stats: dict[str, Any] = {}
@@ -529,14 +531,17 @@ class Scheduler:
                 if boundary % bt == 0 and 0 <= b < len(keys):
                     saves.append((i, keys[b], block_id))
         if saves:
-            self._pins[step] = self._pin([block_id for _, _, block_id in saves])
+            self._pins[step] = (self._pin([block_id for _, _, block_id in saves]), len(saves))
+            self._pinned_blocks += len(saves)
             self._plan.saves = saves
 
     def on_saved_through(self, step: int) -> None:
         """Every worker finished the saves of plans up to ``step``: unpin them."""
         for s in [s for s in self._pins if s <= step]:
             assert self._unpin is not None
-            self._unpin(self._pins.pop(s))
+            token, n = self._pins.pop(s)
+            self._unpin(token)
+            self._pinned_blocks -= n
 
     def has_pending_saves(self) -> bool:
         return bool(self._pins)
@@ -558,6 +563,10 @@ class Scheduler:
         stats, self._stats = self._stats, {}
         if self._prefetching:
             stats["pending_prefetches"] = len(self._prefetching)
+        # GPU blocks held for unfinished saves. Reported on change only, so
+        # the drop to 0 reaches the gauge too.
+        if self._pinned_blocks != self._reported_pinned:
+            stats["pinned_save_blocks"] = self._reported_pinned = self._pinned_blocks
         return stats
 
     def shutdown(self) -> None:

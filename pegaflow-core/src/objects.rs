@@ -33,10 +33,10 @@ use tokio::sync::{mpsc, oneshot};
 use crate::backing::SSD_ALIGNMENT;
 use crate::block::{BlockKey, PrefetchStatus, RawBlock, SealedBlock, Segment};
 use crate::gpu_worker::{LoadCompletion, build_backend, spawn_pinned_worker, wait_worker_ready};
-use crate::metrics::core_metrics;
+use crate::metrics::{core_metrics, record_cache_tier_block_requests};
 use crate::offload::{RawSaveBatch, RawSaveLayer};
 use crate::pinned_pool::{MappedPinnedPtr, PinnedAllocation};
-use crate::storage::MembersPoll;
+use crate::storage::{MembersFetched, MembersPoll};
 use crate::transfer::{CopyDesc, TransferBackend, TransferMode};
 use crate::{EngineError, NumaNode, PegaEngine, QueryLeaseId};
 
@@ -781,10 +781,15 @@ impl PegaEngine {
     ) -> ObjectQueryStatus {
         // A finished fetch answers the query even when it found nothing:
         // starting another one for the same keys would loop forever.
-        let (polled, fetched): (bool, HashMap<BlockKey, Arc<SealedBlock>>) =
+        // `fetched` maps each fetched key to its block and whether a peer served it.
+        let (polled, fetched): (bool, HashMap<BlockKey, (Arc<SealedBlock>, bool)>) =
             match self.storage.poll_members(tag).await {
                 MembersPoll::Loading => return ObjectQueryStatus::Loading,
-                MembersPoll::Done(fetched) => (true, fetched.into_iter().collect()),
+                MembersPoll::Done(MembersFetched { rdma, ssd }) => {
+                    let by_peer = rdma.into_iter().map(|(k, b)| (k, (b, true)));
+                    let by_ssd = ssd.into_iter().map(|(k, b)| (k, (b, false)));
+                    (true, by_peer.chain(by_ssd).collect())
+                }
                 MembersPoll::Idle => (false, HashMap::new()),
             };
         // Touch what is resident; fetched blocks evicted since are still held here.
@@ -793,7 +798,7 @@ impl PegaEngine {
             .get_blocks_aligned(keys)
             .into_iter()
             .zip(keys)
-            .map(|(b, k)| b.or_else(|| fetched.get(k).cloned()))
+            .map(|(b, k)| b.or_else(|| fetched.get(k).map(|(b, _)| Arc::clone(b))))
             .collect();
         if !polled {
             let mut seen = HashSet::new();
@@ -807,21 +812,28 @@ impl PegaEngine {
                 return ObjectQueryStatus::Loading;
             }
         }
+        // Tier per position, as a prefix query attributes its decision.
+        let (mut ram, mut rdma, mut ssd) = (0, 0, 0);
         let mut held = HashMap::new();
         let mut hit_positions = Vec::new();
         for (i, (k, b)) in keys.iter().zip(found).enumerate() {
             if let Some(b) = b {
+                match fetched.get(k) {
+                    Some((_, true)) => rdma += 1,
+                    Some((_, false)) => ssd += 1,
+                    None => ram += 1,
+                }
                 hit_positions.push(i as u32);
                 held.insert(k.clone(), b);
             }
         }
+        let misses = keys.len() - hit_positions.len();
+        record_cache_tier_block_requests(ram, rdma, ssd, misses);
         let metrics = core_metrics();
         metrics
             .cache_block_hits
             .add(hit_positions.len() as u64, &[]);
-        metrics
-            .cache_block_misses
-            .add((keys.len() - hit_positions.len()) as u64, &[]);
+        metrics.cache_block_misses.add(misses as u64, &[]);
         ObjectQueryStatus::Ready {
             hits: hit_positions.len(),
             lease: (!held.is_empty()).then(|| {

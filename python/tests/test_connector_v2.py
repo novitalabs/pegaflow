@@ -482,8 +482,12 @@ def test_saves_pin_blocks_until_every_worker_saved():
     plan = s.take_plan()
     assert sorted(gpu for _, _, gpu in plan.saves) == [5, 6, 31]
     assert s.has_pending_saves() and pinned == [[5, 6, 31]]
+    assert s.take_stats()["pinned_save_blocks"] == 3
     s.on_saved_through(plan.step)
     assert not s.has_pending_saves() and not pinned
+    # The drop to 0 is reported once, so the gauge does not stay stale.
+    assert s.take_stats()["pinned_save_blocks"] == 0
+    assert "pinned_save_blocks" not in s.take_stats()
 
 
 # ------------------------------------------------------------------ worker
