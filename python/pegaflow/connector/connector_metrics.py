@@ -118,6 +118,8 @@ class PegaKVConnectorStats(KVConnectorStats):
     Metrics collected:
     - Scheduler-side (gauge):
         - pending_prefetches: number of requests waiting for SSD prefetch
+        - pinned_save_blocks (connector v2 only): GPU blocks pinned until
+          their saves finish; present only when it changed
     - Scheduler-side (histogram):
         - prefetch_duration: prefetch operation duration in milliseconds
         - prefetch_blocks: number of blocks per prefetch operation
@@ -180,6 +182,8 @@ class PegaKVConnectorStats(KVConnectorStats):
         # Gauge-like metrics: take the latest value
         self.data["pending_prefetches"] = other.data.get("pending_prefetches", 0)
         self.data["pending_save_requests"] = other.data.get("pending_save_requests", 0)
+        if "pinned_save_blocks" in other.data:
+            self.data["pinned_save_blocks"] = other.data["pinned_save_blocks"]
 
         # Counter-like metrics: sum them
         for key in [
@@ -213,6 +217,8 @@ class PegaKVConnectorStats(KVConnectorStats):
             "pending_prefetches": self.data.get("pending_prefetches", 0),
             "pending_save_requests": self.data.get("pending_save_requests", 0),
         }
+        if "pinned_save_blocks" in self.data:
+            result["pinned_save_blocks"] = self.data["pinned_save_blocks"]
 
         # Prefetch stats (scheduler-side)
         prefetch_durations = self.data.get("prefetch_duration", [])
@@ -253,7 +259,8 @@ class PegaKVConnectorStats(KVConnectorStats):
 
     def is_empty(self) -> bool:
         return (
-            self.data.get("pending_prefetches", 0) == 0
+            "pinned_save_blocks" not in self.data
+            and self.data.get("pending_prefetches", 0) == 0
             and self.data.get("pending_save_requests", 0) == 0
             and len(self.data.get("prefetch_duration", [])) == 0
             and len(self.data.get("load_duration", [])) == 0
@@ -302,6 +309,14 @@ class PegaPromMetrics(KVConnectorPromMetrics):
         self.gauge_pending_save_requests = _bind_metric_per_engine(
             self, gauge_pending_save_requests
         )
+
+        # Connector v2: GPU blocks pinned until their saves finish
+        gauge_pinned_save_blocks = self._gauge_cls(
+            name="vllm:pega_pinned_save_blocks",
+            documentation="GPU blocks pinned until their PegaFlow saves finish (connector v2).",
+            labelnames=labelnames,
+        )
+        self.gauge_pinned_save_blocks = _bind_metric_per_engine(self, gauge_pinned_save_blocks)
 
         # Histogram for prefetch operations (scheduler-side)
         # Optimized for fast SSD: typical range 10-500ms
@@ -398,6 +413,11 @@ class PegaPromMetrics(KVConnectorPromMetrics):
         self.gauge_pending_save_requests[engine_idx].set(
             transfer_stats_data.get("pending_save_requests", 0)
         )
+
+        if "pinned_save_blocks" in transfer_stats_data:
+            self.gauge_pinned_save_blocks[engine_idx].set(
+                transfer_stats_data["pinned_save_blocks"]
+            )
 
         # Histogram: prefetch duration (scheduler-side)
         # prefetch_duration is in ms, convert to seconds for Prometheus

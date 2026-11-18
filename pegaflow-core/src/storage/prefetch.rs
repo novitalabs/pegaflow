@@ -202,7 +202,13 @@ pub(crate) enum MembersPoll {
     Idle,
     Loading,
     /// The fetch ended; its blocks are now in the read cache.
-    Done(PrefetchResult),
+    Done(MembersFetched),
+}
+
+/// Blocks a finished membership fetch brought in, by the tier that served them.
+pub(crate) struct MembersFetched {
+    pub(crate) rdma: PrefetchResult,
+    pub(crate) ssd: PrefetchResult,
 }
 
 struct PrefetchState {
@@ -354,9 +360,10 @@ impl PrefetchScheduler {
             client.try_register_namespace_without_reclaim_hint(namespace, hashes);
         }
         read_cache.batch_insert(result.ssd.clone());
-        let mut fetched = result.rdma;
-        fetched.extend(result.ssd);
-        MembersPoll::Done(fetched)
+        MembersPoll::Done(MembersFetched {
+            rdma: result.rdma,
+            ssd: result.ssd,
+        })
     }
 
     pub(super) async fn check_and_prefetch(

@@ -73,6 +73,10 @@ PegaFlow exposes the following metrics for monitoring KV cache operations:
   - Semantics: this is decision attribution. `tier="rdma"` and `tier="ssd"`
     mean the block was selected to be satisfied by that backing tier; they do
     not guarantee the later backing operation succeeded.
+  - RPC V2 `QueryObject` prefix queries attribute the same way. Membership
+    queries (`prefix_search=false`) add only the blocks their fetch brought
+    in, to `rdma` or `ssd`. Their resident hits and misses are not counted:
+    most of their keys are candidate checkpoints the client never uses.
 
 - **pegaflow_cache_block_insertions_total** (Counter)
   - New blocks inserted into cache
@@ -184,6 +188,11 @@ MetaServer (`--http-addr` `/metrics`):
 
 - **pegaflow_hll_total_requests** (Gauge)
   - Total queried blocks in the same configured sliding window, including ready blocks and duplicates
+  - v1 records `query_prefetch` prefix queries of storage group 0. RPC V2
+    records `QueryObject` prefix queries (`prefix_search=true`) when they
+    answer Ready, one entry per object key; membership queries are not
+    recorded. Under a sliding-window layout the window namespaces' prefix
+    queries count too
   - Labels: `window` (`15m`, `1h`, `1d` by default)
   - Use case: Denominator for HLL-based reference reuse rate
 
@@ -277,6 +286,17 @@ tier counters.
 ### RPC Metrics
 - **pegaflow_rpc_requests_total** (Counter) - Total RPC requests by method and status
 - **pegaflow_rpc_duration_seconds** (Histogram) - RPC latency distribution
+
+### vLLM Connector Metrics
+
+Exported by vLLM (`vllm:pega_*`) from the connector's stats, not by the server.
+
+- **vllm:pega_pinned_save_blocks** (Gauge, connector v2 only)
+  - GPU blocks the scheduler holds in vLLM's block pool until every worker has
+    saved the step that planned them. Rising values mean saves lag behind the
+    forward passes and take schedulable KV capacity.
+  - Connector v2 does not report `vllm:pega_pending_save_requests`: its saves
+    are tracked per step, and requests never wait on them to finish.
 
 ## Configuration
 

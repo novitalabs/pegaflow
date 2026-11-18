@@ -23,10 +23,10 @@ use crate::metrics::{SERVED_ROLE_BACKUP_TARGET, SERVED_ROLE_SOURCE, core_metrics
 use crate::pinned_pool::{PinnedAllocation, PinnedAllocator};
 use pegaflow_common::NumaNode;
 
-pub(crate) use prefetch::MembersPoll;
 use prefetch::PrefetchScheduler;
 #[cfg(feature = "rdma")]
 use prefetch::RdmaFetch;
+pub(crate) use prefetch::{MembersFetched, MembersPoll};
 pub(crate) use read_cache::{DEFAULT_BACKUP_RECLAIMABLE_PERCENT, DemotionReason, ReadCache};
 use write_path::{InsertDeps, WritePipeline};
 

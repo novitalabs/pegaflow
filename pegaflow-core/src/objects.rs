@@ -33,10 +33,10 @@ use tokio::sync::{mpsc, oneshot};
 use crate::backing::SSD_ALIGNMENT;
 use crate::block::{BlockKey, PrefetchStatus, RawBlock, SealedBlock, Segment};
 use crate::gpu_worker::{LoadCompletion, build_backend, spawn_pinned_worker, wait_worker_ready};
-use crate::metrics::core_metrics;
+use crate::metrics::{core_metrics, record_cache_tier_block_requests};
 use crate::offload::{RawSaveBatch, RawSaveLayer};
 use crate::pinned_pool::{MappedPinnedPtr, PinnedAllocation};
-use crate::storage::MembersPoll;
+use crate::storage::{MembersFetched, MembersPoll};
 use crate::transfer::{CopyDesc, TransferBackend, TransferMode};
 use crate::{EngineError, NumaNode, PegaEngine, QueryLeaseId};
 
@@ -784,7 +784,13 @@ impl PegaEngine {
         let (polled, fetched): (bool, HashMap<BlockKey, Arc<SealedBlock>>) =
             match self.storage.poll_members(tag).await {
                 MembersPoll::Loading => return ObjectQueryStatus::Loading,
-                MembersPoll::Done(fetched) => (true, fetched.into_iter().collect()),
+                MembersPoll::Done(MembersFetched { rdma, ssd }) => {
+                    // Only the blocks a backing tier brought in: most keys are
+                    // candidate checkpoints the client never uses, so their
+                    // resident hits and misses would skew the tier mix.
+                    record_cache_tier_block_requests(0, rdma.len(), ssd.len(), 0);
+                    (true, rdma.into_iter().chain(ssd).collect())
+                }
                 MembersPoll::Idle => (false, HashMap::new()),
             };
         // Touch what is resident; fetched blocks evicted since are still held here.

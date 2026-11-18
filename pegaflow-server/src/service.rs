@@ -724,7 +724,7 @@ impl Engine for GrpcEngineService {
                             && let Ok(mut t) = self.hll_tracker.lock()
                         {
                             t.record_namespaced_misses(
-                                &namespace,
+                                namespace.as_bytes(),
                                 req.block_hashes.len() as u64,
                                 &req.block_hashes[miss_start..],
                             );
@@ -1253,10 +1253,25 @@ impl Engine for GrpcEngineService {
                 .map(|k| Self::object_key(Some(k)))
                 .collect::<Result<Vec<_>, Status>>()?;
             let query_id = (!query_id.is_empty()).then_some(query_id.as_str());
-            self.engine
+            let (query_id, answer) = self
+                .engine
                 .query_object(&instance_id, query_id, &keys, prefix_search)
                 .await
-                .map_err(Self::map_engine_error)
+                .map_err(Self::map_engine_error)?;
+            // Reference hit rate, as v1: prefix queries only. Membership
+            // queries ask candidate checkpoints of which at most one is used.
+            if prefix_search
+                && let ObjectQueryStatus::Ready { hits, .. } = &answer
+                && let Some(first) = keys.first()
+                && let Ok(mut t) = self.hll_tracker.lock()
+            {
+                let misses: Vec<&[u8]> = keys[(*hits).min(keys.len())..]
+                    .iter()
+                    .map(|k| k.prefix.as_slice())
+                    .collect();
+                t.record_namespaced_misses(&first.namespace, keys.len() as u64, &misses);
+            }
+            Ok((query_id, answer))
         };
         let result = trace_in_span!(root, fut).await;
         Self::log_v2("query_object", &result, start, &detail);

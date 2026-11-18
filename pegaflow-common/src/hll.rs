@@ -436,11 +436,11 @@ impl MultiWindowHllTracker {
     /// identities that were misses into HLL. Repeated misses remain deduped by
     /// HLL, preserving the infinite-cache reuse reference without discarding
     /// historical observations.
-    pub fn record_namespaced_misses(
+    pub fn record_namespaced_misses<H: AsRef<[u8]>>(
         &mut self,
-        namespace: &str,
+        namespace: &[u8],
         total_requests: u64,
-        miss_hashes: &[Vec<u8>],
+        miss_hashes: &[H],
     ) {
         if total_requests == 0 {
             return;
@@ -449,7 +449,7 @@ impl MultiWindowHllTracker {
 
         let namespaced_hashes: Vec<[u8; 8]> = miss_hashes
             .iter()
-            .map(|hash| namespaced_hash(namespace, hash))
+            .map(|hash| namespaced_hash(namespace, hash.as_ref()))
             .collect();
         for (_, tracker) in &mut self.windows {
             tracker.record_hashes_with_total(&namespaced_hashes, total_requests);
@@ -472,7 +472,7 @@ impl MultiWindowHllTracker {
 /// architecture, or build. FNV-1a with a splitmix64 finalizer is fully
 /// specified byte-by-byte; do not replace it with a hasher that does not
 /// guarantee cross-platform stability (e.g. ahash, SipHash with random keys).
-fn namespaced_hash(namespace: &str, block_hash: &[u8]) -> [u8; 8] {
+fn namespaced_hash(namespace: &[u8], block_hash: &[u8]) -> [u8; 8] {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut h = FNV_OFFSET;
@@ -480,7 +480,7 @@ fn namespaced_hash(namespace: &str, block_hash: &[u8]) -> [u8; 8] {
     for &byte in (namespace.len() as u64)
         .to_le_bytes()
         .iter()
-        .chain(namespace.as_bytes())
+        .chain(namespace)
         .chain(block_hash)
     {
         h = (h ^ u64::from(byte)).wrapping_mul(FNV_PRIME);
@@ -868,7 +868,7 @@ mod tests {
         let mut tracker =
             MultiWindowHllTracker::new(vec![("15m".into(), Duration::from_secs(15 * 60))], 14);
         let miss = vec![sha256_like(1).to_vec(), sha256_like(2).to_vec()];
-        tracker.record_namespaced_misses("model", 5, &miss);
+        tracker.record_namespaced_misses(b"model", 5, &miss);
 
         let metric = tracker.metrics().remove(0).1;
         assert_eq!(metric.total_requests, 5);
@@ -880,7 +880,7 @@ mod tests {
     fn namespaced_misses_allow_all_hit_observation_without_hll_insert() {
         let mut tracker =
             MultiWindowHllTracker::new(vec![("15m".into(), Duration::from_secs(15 * 60))], 14);
-        tracker.record_namespaced_misses("model", 4, &[]);
+        tracker.record_namespaced_misses::<Vec<u8>>(b"model", 4, &[]);
 
         let metric = tracker.metrics().remove(0).1;
         assert_eq!(metric.total_requests, 4);
@@ -893,8 +893,8 @@ mod tests {
         let mut tracker =
             MultiWindowHllTracker::new(vec![("15m".into(), Duration::from_secs(15 * 60))], 16);
         let raw_hash = vec![42; 32];
-        tracker.record_namespaced_misses("model-a", 1, std::slice::from_ref(&raw_hash));
-        tracker.record_namespaced_misses("model-b", 1, std::slice::from_ref(&raw_hash));
+        tracker.record_namespaced_misses(b"model-a", 1, std::slice::from_ref(&raw_hash));
+        tracker.record_namespaced_misses(b"model-b", 1, std::slice::from_ref(&raw_hash));
 
         let metric = tracker.metrics().remove(0).1;
         assert_eq!(metric.total_requests, 2);
