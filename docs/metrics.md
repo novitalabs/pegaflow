@@ -74,9 +74,9 @@ PegaFlow exposes the following metrics for monitoring KV cache operations:
     mean the block was selected to be satisfied by that backing tier; they do
     not guarantee the later backing operation succeeded.
   - RPC V2 `QueryObject` prefix queries attribute the same way. Membership
-    queries (`prefix_search=false`) attribute once, when they answer Ready,
-    by where each key's block came from: `rdma`/`ssd` count only blocks the
-    fetch actually brought in, the rest of the held keys count as `ram`.
+    queries (`prefix_search=false`) add only the blocks their fetch brought
+    in, to `rdma` or `ssd`. Their resident hits and misses are not counted:
+    most of their keys are candidate checkpoints the client never uses.
 
 - **pegaflow_cache_block_insertions_total** (Counter)
   - New blocks inserted into cache

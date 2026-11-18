@@ -781,14 +781,15 @@ impl PegaEngine {
     ) -> ObjectQueryStatus {
         // A finished fetch answers the query even when it found nothing:
         // starting another one for the same keys would loop forever.
-        // `fetched` maps each fetched key to its block and whether a peer served it.
-        let (polled, fetched): (bool, HashMap<BlockKey, (Arc<SealedBlock>, bool)>) =
+        let (polled, fetched): (bool, HashMap<BlockKey, Arc<SealedBlock>>) =
             match self.storage.poll_members(tag).await {
                 MembersPoll::Loading => return ObjectQueryStatus::Loading,
                 MembersPoll::Done(MembersFetched { rdma, ssd }) => {
-                    let by_peer = rdma.into_iter().map(|(k, b)| (k, (b, true)));
-                    let by_ssd = ssd.into_iter().map(|(k, b)| (k, (b, false)));
-                    (true, by_peer.chain(by_ssd).collect())
+                    // Only the blocks a backing tier brought in: most keys are
+                    // candidate checkpoints the client never uses, so their
+                    // resident hits and misses would skew the tier mix.
+                    record_cache_tier_block_requests(0, rdma.len(), ssd.len(), 0);
+                    (true, rdma.into_iter().chain(ssd).collect())
                 }
                 MembersPoll::Idle => (false, HashMap::new()),
             };
@@ -798,7 +799,7 @@ impl PegaEngine {
             .get_blocks_aligned(keys)
             .into_iter()
             .zip(keys)
-            .map(|(b, k)| b.or_else(|| fetched.get(k).map(|(b, _)| Arc::clone(b))))
+            .map(|(b, k)| b.or_else(|| fetched.get(k).cloned()))
             .collect();
         if !polled {
             let mut seen = HashSet::new();
@@ -812,28 +813,21 @@ impl PegaEngine {
                 return ObjectQueryStatus::Loading;
             }
         }
-        // Tier per position, as a prefix query attributes its decision.
-        let (mut ram, mut rdma, mut ssd) = (0, 0, 0);
         let mut held = HashMap::new();
         let mut hit_positions = Vec::new();
         for (i, (k, b)) in keys.iter().zip(found).enumerate() {
             if let Some(b) = b {
-                match fetched.get(k) {
-                    Some((_, true)) => rdma += 1,
-                    Some((_, false)) => ssd += 1,
-                    None => ram += 1,
-                }
                 hit_positions.push(i as u32);
                 held.insert(k.clone(), b);
             }
         }
-        let misses = keys.len() - hit_positions.len();
-        record_cache_tier_block_requests(ram, rdma, ssd, misses);
         let metrics = core_metrics();
         metrics
             .cache_block_hits
             .add(hit_positions.len() as u64, &[]);
-        metrics.cache_block_misses.add(misses as u64, &[]);
+        metrics
+            .cache_block_misses
+            .add((keys.len() - hit_positions.len()) as u64, &[]);
         ObjectQueryStatus::Ready {
             hits: hit_positions.len(),
             lease: (!held.is_empty()).then(|| {
